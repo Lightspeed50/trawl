@@ -121,6 +121,7 @@ jobs:
             # per Docker convention; type=ref would mirror the v through). type=semver also
             # auto-attaches :latest via the default latest=auto flavor.
             type=semver,pattern={{version}}
+            type=raw,value=latest
 
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
