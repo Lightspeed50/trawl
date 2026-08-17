@@ -23,18 +23,38 @@ const state: {
 export const getPool = () => state.pool
 
 const initSessionCache = async (): Promise<void> => {
-  try {
+  const maxAttempts = 5
+  const delayMs = 1000
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const sessionCache = new SessionCache({
       redisUrl: REDIS_URL,
       ttlSeconds: SESSION_TTL,
     })
-    await sessionCache.connect()
-    state.sessionCache = sessionCache
-    console.log("[api] session cache connected  (Tier 2 fast-path enabled)")
-  } catch (err) {
-    state.sessionCache = undefined
-    console.warn("[api] session cache unavailable — Tier 2 disabled:", err instanceof Error ? err.message : err)
+
+    try {
+      await sessionCache.connect(3000)
+
+      state.sessionCache = sessionCache
+      console.log("[api] session cache connected (Tier 2 fast-path enabled)")
+      return
+    } catch (err) {
+      sessionCache.close?.()
+
+      console.warn(
+        `[api] Redis session cache attempt ${attempt}/${maxAttempts} failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
+
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+    }
   }
+
+  state.sessionCache = undefined
+  console.warn("[api] session cache unavailable — Tier 2 disabled")
 }
 
 export const initPool = async (): Promise<void> => {
