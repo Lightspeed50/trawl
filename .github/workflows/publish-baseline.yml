@@ -29,7 +29,7 @@ on:
       - "*-baseline"
 
 env:
-  IMAGE: ghcr.io/${{ lightspeed50 }}/trawl
+  IMAGE: ghcr.io/lightspeed50/trawl
 
 jobs:
   build:
