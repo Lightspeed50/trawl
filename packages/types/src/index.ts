@@ -25,8 +25,126 @@ export interface ScrapeRequest {
   headers?: Record<string, string>
   method?: SupportedMethod
   body?: string
-  // Per-request proxy override — bypasses the server-configured proxy pool for this call.
+  // Strict per-request route: target traffic must use this proxy and never fall back direct.
   proxy?: string
+  // Opt-in viewport screenshot from the browser tiers (2-4), returned as
+  // `ScrapeResult.screenshot`. Off by default — it costs a settle wait and payload
+  // size. Tier 1 is a plain HTTP fetch and never produces one.
+  screenshot?: boolean
+  // Opt-in browser console capture from the browser tiers (2-4), returned as
+  // `ScrapeResult.consoleLogs`. Off by default — no listener is attached without it.
+  consoleLogs?: boolean
+  // Opt-in per-request resource timings from the browser tiers (2-4), returned as
+  // `ScrapeResult.networkLogs`. Off by default — no listener is attached without it.
+  networkLogs?: boolean
+  // Opt-in main-document redirect chain from the browser tiers (2-4), returned as
+  // `ScrapeResult.redirectChain`. Off by default.
+  redirectChain?: boolean
+  // Opt-in response-body capture from the browser tiers (2-4), returned as
+  // `ScrapeResult.capturedResponses`. Each entry is a URL substring, or a glob matched
+  // against the whole URL when it contains `*` or `?`. Off by default — no listener is
+  // attached without it.
+  captureResponses?: string[]
+  // How long (milliseconds) to hold the page open after load waiting for a match. Ends
+  // early on the first captured body, on `waitForSelector`, or on network idle. Only
+  // meaningful alongside `captureResponses`.
+  settleTimeout?: number
+  // CSS selector that also ends the settle window early. Only meaningful alongside
+  // `captureResponses`.
+  waitForSelector?: string
+  // Opt-in evidence from a challenge wall no tier could clear. Costs nothing on a
+  // successful scrape: it is only ever attached to the terminal failure (`blockedEvidence`
+  // on the 500 body), never to `ScrapeResult`. The image rides along only when
+  // `screenshot` is also set.
+  blockedEvidence?: boolean
+  // Opt-in MHTML archive of the page from the browser tiers (2-4), returned as
+  // `ScrapeResult.mhtml`. Assembled from the subresources the response listener observes,
+  // not snapshotted by the engine — Firefox has no Page.captureSnapshot. Off by default;
+  // only bounded, identity-encoded responses with a declared length are read.
+  mhtml?: boolean
+  // Opt-in: load the page even when its TLS certificate fails verification (expired,
+  // self-signed, issued for another host). Off by default, so every other caller keeps a
+  // verified connection. Because an unverified connection no longer proves whose page came
+  // back, a landing on a host the requested URL does not demonstrably lead to is refused
+  // instead of returned — see `certificateError` and the crossed-landing guard in
+  // @trawl/tiers.
+  ignoreCertificateErrors?: boolean
+  // Opt-in favicon collection from the browser tiers (2-4), returned as
+  // `ScrapeResult.favicons`. The apex `/favicon.ico` and every declared
+  // `<link rel~="icon">` are fetched from inside the page, so they carry the origin's
+  // cookies and the session's challenge clearance. Off by default: it costs one request
+  // per icon.
+  favicons?: boolean
+}
+
+// One browser console message. Shaped after WebDriver's browser log so a consumer can
+// treat both sources alike: `level` is the severity vocabulary (SEVERE/WARNING/INFO/
+// DEBUG), `source` the console type that produced it, `timestamp` epoch milliseconds.
+export interface ConsoleLogEntry {
+  level: "SEVERE" | "WARNING" | "INFO" | "DEBUG"
+  message: string
+  timestamp: number
+  source: string
+}
+
+// One request's resource timing, shaped after PerformanceResourceTiming: `name` is the
+// URL, `startTime` is milliseconds since the capture attached, `duration` milliseconds
+// from request start to the last byte (0 for a request that never completed). Sizes are
+// null until the browser reports them; `decodedBodySize` stays null because knowing it
+// would mean reading every response body.
+export interface NetworkLogEntry {
+  name: string
+  entryType: "navigation" | "resource"
+  startTime: number
+  duration: number
+  initiatorType: string
+  transferSize: number | null
+  encodedBodySize: number | null
+  decodedBodySize: number | null
+}
+
+// One response whose URL matched a caller-supplied `captureResponses` pattern. `body` is
+// the response payload as text, or base64 when the content type is binary or unknown
+// (`base64Encoded`); it is `null` when the body could not be read, in which case `error`
+// says why. `truncated` marks a body trimmed to the configured byte budget.
+export interface CapturedResponseEntry {
+  url: string
+  status: number
+  headers: Record<string, string>
+  body: string | null
+  base64Encoded: boolean
+  truncated: boolean
+  error?: string
+}
+
+// One of the page's favicons, fetched from inside the page. `data` is base64 with no
+// `data:` prefix and is absent when the icon could not be read, in which case `error`
+// says why — "no icon there" and "we could not fetch it" are different answers, and
+// collapsing them is what hides a favicon the site serves but the scraper never gets.
+// `url` is the absolute icon URL, or `data:<mime>` for an inline icon.
+export interface FaviconEntry {
+  url: string
+  contentType?: string
+  data?: string
+  error?: string
+}
+
+// The challenge wall a scrape stopped at, from the last browser tier that rendered one.
+// Returned only on the failure path (`blockedEvidence` on the 500 body) and only when the
+// request asked for it — a blocked outcome is never dressed up as a successful result.
+export interface BlockedEvidence {
+  tier: 2 | 3 | 4
+  status: "blocked" | "timeout"
+  // Same string as the matching `timings[].reason`, e.g. "cloudflare-persistent".
+  reason?: string
+  // Where the browser actually stood when it gave up, after any challenge redirects.
+  url: string
+  statusCode?: number
+  html: string
+  // The wall's markup exceeded BLOCKED_EVIDENCE_MAX_HTML_CHARS and `html` is the head of it.
+  htmlTruncated?: boolean
+  // Base64 JPEG, present only when the request also asked for a `screenshot`.
+  screenshot?: string
 }
 
 export interface TierResult {
@@ -47,7 +165,7 @@ export interface ScrapeResult {
   timings: TierResult[]
   totalMs: number
   captchasSolved?: string[] // captcha types solved during this request (e.g. ['turnstile', 'recaptcha-v2'])
-  proxyUsed?: boolean // true if the winning tier routed through a proxy (Tier 3 datacenter pool or Tier 4 residential pool/override)
+  proxyUsed?: boolean // true if the winning tier routed through a proxy (Tier 1, 3, or 4)
   // Raw response payload — populated by all tiers when available. The MITM proxy
   // (:8192) consumes this; /scrape and FlareSolverr /v1 still rely on `html` only.
   // Binary content (images, .torrent, videos) MUST use this field — `html` would
@@ -58,6 +176,37 @@ export interface ScrapeResult {
   responseHeaders?: Record<string, string>
   // Convenience: extracted Content-Type header. Same as responseHeaders['content-type'].
   contentType?: string
+  // Base64 JPEG of the viewport, present only when the request asked for it and a
+  // browser tier served the page. No `data:` prefix.
+  screenshot?: string
+  // Browser console messages, in the order the page logged them. Present (possibly
+  // empty) only when the request asked for them and a browser tier served the page.
+  consoleLogs?: ConsoleLogEntry[]
+  // Resource timings for the requests the page made, in completion order. Same
+  // presence rules as `consoleLogs`.
+  networkLogs?: NetworkLogEntry[]
+  // URLs the main document walked, in order, first entry being the requested URL.
+  // Same presence rules as `consoleLogs`.
+  redirectChain?: string[]
+  // Bodies of the responses whose URL matched `captureResponses`, in arrival order.
+  // Present (possibly empty, meaning nothing matched) only when the request asked for
+  // capture and a browser tier served the page.
+  capturedResponses?: CapturedResponseEntry[]
+  // Multipart/related archive of a successful HTML page: the rendered document first,
+  // then safely readable CSS, script, image and font subresources observed loading. Same
+  // presence rules as `consoleLogs`. An approximation of browser "Save as MHTML", not a
+  // byte-faithful snapshot; omissions are counted inside the archive.
+  mhtml?: string
+  // Why a Tier 1 TLS hop's certificate failed verification when `ignoreCertificateErrors`
+  // was set and the page was served anyway (e.g. "self-signed certificate"). Absent when
+  // every observed certificate verified, when the caller did not opt in, and when no
+  // verified attempt was made (`skipHttp`) — absence is "not observed", not proof that the
+  // certificate was valid.
+  certificateError?: string
+  // The page's favicons, apex `/favicon.ico` first and then the declared icons in
+  // document order. Present (possibly empty) only when the request asked for them and a
+  // browser tier served the page.
+  favicons?: FaviconEntry[]
 }
 
 export interface SessionData {
@@ -107,6 +256,8 @@ export interface BrowserFingerprint {
 // (consumers call .newPage()/.newContext()/.cookies() etc directly on these fields).
 export interface BrowserHandle {
   id: number
+  /** Whether this lease belongs to a browser running behind a virtual display. */
+  headful: boolean
   // Identifies this specific checkout. Pass it back to release() so a request that
   // outlived its checkout can't free a browser the pool has since reclaimed.
   lease: number

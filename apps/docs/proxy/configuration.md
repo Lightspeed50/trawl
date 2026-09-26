@@ -7,31 +7,49 @@ description: Enable and configure TRAWL's challenge-bypassing HTTP/HTTPS proxy.
 
 ## Environment variables
 
-| Variable              | Default          | Purpose                                                  |
-| --------------------- | ---------------- | -------------------------------------------------------- |
-| `MITM_PROXY_ENABLED`  | `false`          | Starts the forward-proxy listener                        |
-| `MITM_PROXY_HOST`     | `0.0.0.0`        | Listener bind address                                    |
-| `MITM_PROXY_PORT`     | `8192`           | Listener port                                            |
-| `MITM_PROXY_CA_DIR`   | `/data/proxy-ca` | Persistent root CA certificate and private-key directory |
-| `MITM_PROXY_MAX_TIER` | `4`              | Highest solver tier available to proxy escalation        |
-| `MITM_PROXY_DEBUG`    | `false`          | Logs proxied requests and tier attempts                  |
+| Variable                   | Default          | Purpose                                                  |
+| -------------------------- | ---------------- | -------------------------------------------------------- |
+| `MITM_ENABLED`       | `false`          | Starts the forward-proxy listener                        |
+| `MITM_HOST`          | `0.0.0.0`        | Listener bind address                                    |
+| `MITM_PORT`          | `8192`           | Listener port                                            |
+| `MITM_CA_DIR`        | `/data/proxy-ca` | Persistent root CA certificate and private-key directory |
+| `MITM_MAX_TIER`      | `4`              | Highest solver tier available to proxy escalation        |
+| `MITM_ALWAYS_SCRAPE` | `false`          | Skip direct Tier 0 and enter the scraper immediately     |
+| `MITM_DEBUG`         | `false`          | Logs proxied requests and tier attempts                  |
+| `SCRAPE_MIN_TIER`    | `1`              | Lowest tier once a request enters the scraper ladder     |
+| `SCRAPE_PROXY_SELECTION` | `failover`   | Tier 3/4 pool policy: failover, round-robin, or random   |
 
 Example:
 
 ```ini
-MITM_PROXY_ENABLED=true
-MITM_PROXY_HOST=127.0.0.1
-MITM_PROXY_PORT=8192
-MITM_PROXY_CA_DIR=/data/proxy-ca
-MITM_PROXY_MAX_TIER=4
-MITM_PROXY_DEBUG=false
+MITM_ENABLED=true
+MITM_HOST=127.0.0.1
+MITM_PORT=8192
+MITM_CA_DIR=/data/proxy-ca
+MITM_MAX_TIER=4
+MITM_ALWAYS_SCRAPE=false
+SCRAPE_MIN_TIER=1
+SCRAPE_PROXY_SELECTION=failover
+MITM_DEBUG=false
 ```
 
 Use `127.0.0.1` for a local installation. Docker clients on a bridge network normally require
 `0.0.0.0`; restrict access with container networking or a host firewall.
 
-`MITM_PROXY_MAX_TIER=3` prevents proxy requests from consuming a configured residential Tier 4
+`MITM_MAX_TIER=3` prevents proxy requests from consuming a configured residential Tier 4
 proxy. An empty or invalid value uses the normal maximum of Tier 4.
+
+Set `MITM_ALWAYS_SCRAPE=true` for targets where the proxy's initial direct Tier 0 request is
+itself enough to trigger a temporary ban. This skips only proxy Tier 0: the normal scraper ladder
+starts at `SCRAPE_MIN_TIER` and escalates when necessary. To prevent both Tier 0 and Tier 1 traffic,
+set `MITM_ALWAYS_SCRAPE=true` together with `SCRAPE_MIN_TIER=2`. WebSocket upgrades remain direct
+relays.
+
+Always-scrape mode also bypasses Tier 0's media and large-file streaming path. Do not enable it on
+a general download or media proxy: video, archives, Range requests, and other large responses may
+instead be buffered by the scraper, and request bodies pass through the scraper's text-oriented
+request interface. Prefer a separate TRAWL instance or narrowly scoped proxy rule for affected
+sites.
 
 ## Docker Compose
 
@@ -44,10 +62,12 @@ services:
       - "8191:8191"
       - "8192:8192"
     environment:
-      MITM_PROXY_ENABLED: "true"
-      MITM_PROXY_HOST: 0.0.0.0
-      MITM_PROXY_PORT: 8192
-      MITM_PROXY_CA_DIR: /data/proxy-ca
+      MITM_ENABLED: "true"
+      MITM_HOST: 0.0.0.0
+      MITM_PORT: 8192
+      MITM_CA_DIR: /data/proxy-ca
+      MITM_ALWAYS_SCRAPE: "false"
+      SCRAPE_MIN_TIER: "1"
     volumes:
       - trawl_proxy_ca:/data/proxy-ca
 
@@ -68,7 +88,7 @@ Tier 0 direct traffic leaves from the TRAWL host directly. `PROXY_URL` and
 not turn the entire forward proxy into a chain through another proxy.
 
 The normal sticky-per-domain rotation and failure cooldown rules apply during escalation. Use
-`MITM_PROXY_MAX_TIER` to cap which tiers the forward proxy may reach.
+`MITM_MAX_TIER` to cap which tiers the forward proxy may reach.
 
 ## Verify the listener
 
@@ -100,7 +120,7 @@ The Range request should return `206` and a 100-byte body when the upstream supp
 
 ## Debug logging
 
-Set `MITM_PROXY_DEBUG=true` to log direct forwarding, streaming decisions, challenge escalation,
+Set `MITM_DEBUG=true` to log direct forwarding, streaming decisions, challenge escalation,
 winning scrape tiers, statuses, content types, and payload sizes. Disable it after troubleshooting;
 general proxy clients can generate a large volume of requests.
 

@@ -21,6 +21,12 @@ const CLOSE_TIMEOUT_MS = 10_000
 // launch timeout does not cover. 90s is generous but finite.
 const LAUNCH_TIMEOUT_MS = 90_000
 
+/** Firefox must neither bypass a proxy nor resolve SOCKS destinations through host DNS. */
+export const PROXY_SAFETY_FIREFOX_PREFS = Object.freeze({
+  "network.proxy.failover_direct": false,
+  "network.proxy.socks_remote_dns": true,
+})
+
 type AsyncAction = () => unknown | Promise<unknown>
 
 const settle = (action: AsyncAction): Promise<void> =>
@@ -83,6 +89,8 @@ export class BrowserPool {
   private pollIntervalMs: number
   private recycleAfterTemporaryContexts: number
   private contentProcesses!: number
+  private virtualDisplay: boolean
+  private label: string
   private stallAfterMs: number
   private closeTimeoutMs: number
   private launchTimeoutMs: number
@@ -100,6 +108,8 @@ export class BrowserPool {
     pollIntervalMs = 100,
     recycleAfterTemporaryContexts = 8,
     contentProcesses = 2,
+    virtualDisplay = false,
+    label = "pool",
     stallAfterMs = 180_000,
     closeTimeoutMs = CLOSE_TIMEOUT_MS,
     launchTimeoutMs = LAUNCH_TIMEOUT_MS,
@@ -112,6 +122,8 @@ export class BrowserPool {
     pollIntervalMs?: number
     recycleAfterTemporaryContexts?: number
     contentProcesses?: number
+    virtualDisplay?: boolean
+    label?: string
     stallAfterMs?: number
     closeTimeoutMs?: number
     launchTimeoutMs?: number
@@ -124,6 +136,8 @@ export class BrowserPool {
     this.pollIntervalMs = pollIntervalMs
     this.recycleAfterTemporaryContexts = recycleAfterTemporaryContexts
     this.contentProcesses = contentProcesses
+    this.virtualDisplay = virtualDisplay
+    this.label = label
     this.stallAfterMs = stallAfterMs
     this.closeTimeoutMs = closeTimeoutMs
     this.launchTimeoutMs = launchTimeoutMs
@@ -165,7 +179,7 @@ export class BrowserPool {
         temporaryContextUses: 0,
         fingerprint,
       })
-      console.log(`[pool] browser ${i + 1}/${this.poolSize} ready (UA=${fingerprint.platform})`)
+      console.log(`[${this.label}] browser ${i + 1}/${this.poolSize} ready (UA=${fingerprint.platform})`)
     }
 
     // Camoufox performs one-time shared addon setup during its first launch; racing
@@ -217,7 +231,9 @@ export class BrowserPool {
     //   `main_world_eval` — required for Turnstile's shadow-DOM checkbox.
     //   `forceScopeAccess` — C++-level cross-origin frame scope, COOP-friendly.
     const browser = await Camoufox({
-      headless: true,
+      // `"virtual"` launches headful Camoufox behind Xvfb; camoufox-js tears the display
+      // down with the browser. This mode is used by the optional DataDome pool.
+      headless: this.virtualDisplay ? "virtual" : true,
       os: [camoufoxOs],
       // Screen + window randomization — Camoufox picks from the constraints per launch.
       // `screen` lets us set min/max bounds; `window` is a single fixed tuple per type
@@ -244,6 +260,8 @@ export class BrowserPool {
       // maps this to firefoxUserPrefs). The earlier `prefs` key was silently
       // ignored, so these settings were dead code in 1.0.0.
       firefox_user_prefs: {
+        // Never bypass a configured proxy when it is unavailable.
+        ...PROXY_SAFETY_FIREFOX_PREFS,
         "dom.ipc.processCount": this.contentProcesses,
         "dom.ipc.processPrelaunch": false,
         "dom.ipc.contentProcessCount": this.contentProcesses,
@@ -336,6 +354,7 @@ export class BrowserPool {
         entry.lastUsedAt = Date.now()
         resolve({
           id: entry.id,
+          headful: this.virtualDisplay,
           lease: entry.lease,
           context: entry.context,
           browser: entry.browser,
@@ -403,7 +422,7 @@ export class BrowserPool {
     this.replacementRunning = true
     const reason = entry.replacementRequested as string
     entry.replacementRequested = undefined
-    console.warn(`[pool] browser ${entry.id} warming replacement: ${reason}`)
+    console.warn(`[${this.label}] browser ${entry.id} warming replacement: ${reason}`)
 
     let replacement: { browser: Browser; context: BrowserContext } | undefined
     try {
@@ -434,7 +453,7 @@ export class BrowserPool {
       entry.restartCount++
       entry.healthy = true
       entry.lease++
-      console.log(`[pool] browser ${entry.id} rolling replacement installed (total: ${entry.restartCount})`)
+      console.log(`[${this.label}] browser ${entry.id} rolling replacement installed (total: ${entry.restartCount})`)
 
       await settleWithin(pendingPageCloses ? () => pendingPageCloses : undefined, this.closeTimeoutMs)
       await settleWithin(() => retiredContext?.close(), this.closeTimeoutMs)
@@ -442,7 +461,7 @@ export class BrowserPool {
     } catch (err) {
       // A failed warm-up never disturbs the browser currently serving the entry.
       entry.replacementRequested ??= reason
-      console.error(`[pool] browser ${entry.id} failed to warm replacement:`, err)
+      console.error(`[${this.label}] browser ${entry.id} failed to warm replacement:`, err)
     } finally {
       if (replacement) {
         await settleWithin(() => replacement?.context?.close(), this.closeTimeoutMs)
@@ -506,14 +525,14 @@ export class BrowserPool {
         // alone, the entry is subtracted from the pool for the rest of the process.
         if (this.isStalled(entry, now)) {
           const heldSec = Math.round((now - (entry.busySince ?? now)) / 1000)
-          console.warn(`[pool] browser ${entry.id} stalled — checked out for ${heldSec}s, reclaiming`)
+          console.warn(`[${this.label}] browser ${entry.id} stalled — checked out for ${heldSec}s, reclaiming`)
           await this.restartEntry(entry, "checkout stalled")
         }
         continue
       }
 
       if (!(entry.browser?.isConnected() ?? false)) {
-        console.warn(`[pool] browser ${entry.id} disconnected, restarting`)
+        console.warn(`[${this.label}] browser ${entry.id} disconnected, restarting`)
         await this.restartEntry(entry, "browser disconnected")
       } else {
         entry.healthy = true
@@ -595,7 +614,7 @@ export class BrowserPool {
     entry.stallAt = undefined
     entry.lease++
     entry.restartReason = undefined
-    console.warn(`[pool] browser ${entry.id} restarting: ${reason}`)
+    console.warn(`[${this.label}] browser ${entry.id} restarting: ${reason}`)
     const dyingContext = entry.context
     const dyingBrowser = entry.browser
     const pendingPageCloses = entry.pendingPageCloses
@@ -632,11 +651,11 @@ export class BrowserPool {
       entry.healthy = true
       entry.temporaryContextUses = 0
       entry.restartCount++
-      console.log(`[pool] browser ${entry.id} restarted (total: ${entry.restartCount})`)
+      console.log(`[${this.label}] browser ${entry.id} restarted (total: ${entry.restartCount})`)
     } catch (err) {
       // Leave the entry unhealthy with no browser attached. `restarting` clears in the
       // finally, so the next health-check tick retries this entry from scratch.
-      console.error(`[pool] browser ${entry.id} failed to restart:`, err)
+      console.error(`[${this.label}] browser ${entry.id} failed to restart:`, err)
     } finally {
       entry.restarting = false
     }
@@ -694,11 +713,20 @@ type FreshBrowser = any
 type FreshContext = any
 export const newFreshContext = async (
   browser: FreshBrowser,
-  options?: { proxy?: string; onCreated?: () => void; requestReplacement?: (reason: string) => void },
+  options?: {
+    proxy?: string
+    onCreated?: () => void
+    requestReplacement?: (reason: string) => void
+    // Load the page even when its certificate fails verification. Per-context on purpose:
+    // the pooled contexts every other scrape uses keep a verified connection, and only the
+    // temporary context created for an opted-in request relaxes it.
+    ignoreHttpsErrors?: boolean
+  },
 ): Promise<FreshContext> => {
   const context = await browser.newContext({
     viewport: null,
     ...(options?.proxy ? { proxy: toPlaywrightProxy(options.proxy) } : {}),
+    ...(options?.ignoreHttpsErrors ? { ignoreHTTPSErrors: true } : {}),
   })
   options?.onCreated?.()
   try {

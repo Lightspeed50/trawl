@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { scrape } from "../src/orchestrator"
 import { runTier1 } from "../src/tiers/1"
 
 interface RecordedCall {
@@ -37,6 +38,81 @@ afterEach(() => {
 })
 
 describe("runTier1 — POST support", () => {
+  test("reports the same fingerprint UA that the orchestrator sends", async () => {
+    const restore = installFetchMock()
+    try {
+      const result = await scrape(
+        { url: "https://example.com/x", maxTier: 1 },
+        {
+          acquireBrowser: async () => {
+            throw new Error("Tier 1 success must not acquire a browser")
+          },
+          releaseBrowser: () => {},
+          loadSession: async () => undefined,
+          saveSession: async () => {},
+          invalidateSession: async () => {},
+        },
+      )
+
+      const headers = recorded[0].init?.headers as Record<string, string>
+      expect(result.userAgent).toBe(headers["User-Agent"] ?? headers["user-agent"])
+    } finally {
+      restore()
+    }
+  })
+
+  test("passes an explicit HTTP proxy to Bun fetch", async () => {
+    const restore = installFetchMock()
+    try {
+      const result = await runTier1("https://target.example/x", undefined, undefined, undefined, "http://proxy:8080")
+      expect(result.status).toBe("success")
+      expect((recorded[0].init as RequestInit & { proxy?: string }).proxy).toBe("http://proxy:8080")
+    } finally {
+      restore()
+    }
+  })
+
+  test("normalizes proxy authentication and Proxy-Status failures", async () => {
+    let restore = installFetchMock(
+      () => new Response("proxy auth", { status: 407, headers: { "content-type": "text/plain" } }),
+    )
+    try {
+      const result = await runTier1("https://target.example/x", undefined, undefined, undefined, "http://proxy:8080")
+      expect(result.status).toBe("error")
+      expect(result.reason).toBe("proxy-authentication-failed")
+    } finally {
+      restore()
+    }
+
+    restore = installFetchMock(
+      () =>
+        new Response("upstream failed", {
+          status: 502,
+          headers: { "content-type": "text/plain", "proxy-status": "proxy.example; error=connection_timeout" },
+        }),
+    )
+    try {
+      const result = await runTier1("https://target.example/x", undefined, undefined, undefined, "http://proxy:8080")
+      expect(result.status).toBe("error")
+      expect(result.reason).toBe("proxy-connection-failed")
+    } finally {
+      restore()
+    }
+  })
+
+  test("normalizes an explicit proxy transport failure", async () => {
+    const restore = installFetchMock(() => {
+      throw new Error("TLS connection aborted")
+    })
+    try {
+      const result = await runTier1("https://target.example/x", undefined, undefined, undefined, "https://proxy:1001")
+      expect(result.status).toBe("error")
+      expect(result.reason).toBe("proxy-connection-failed")
+    } finally {
+      restore()
+    }
+  })
+
   test("uses GET with no body when method is omitted", async () => {
     const restore = installFetchMock()
     try {
@@ -137,6 +213,21 @@ describe("runTier1 — POST support", () => {
       expect(result.contentType).toBe("text/html; charset=utf-8")
       expect(result.responseHeaders?.["x-test"]).toBe("akamai")
       expect(new TextDecoder().decode(result.body)).toBe(html)
+    } finally {
+      restore()
+    }
+  })
+
+  test("preserves multiple Set-Cookie fields without splitting Expires commas", async () => {
+    const headers = new Headers({ "content-type": "text/html" })
+    headers.append("set-cookie", "session=one; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/")
+    headers.append("set-cookie", "clearance=two; Path=/; HttpOnly")
+    const restore = installFetchMock(() => new Response("<html>OK</html>", { headers }))
+    try {
+      const result = await runTier1("https://example.com/")
+      expect(result.responseHeaders?.["set-cookie"]).toBe(
+        "session=one; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/\nclearance=two; Path=/; HttpOnly",
+      )
     } finally {
       restore()
     }

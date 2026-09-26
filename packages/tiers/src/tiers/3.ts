@@ -1,28 +1,58 @@
 import type { BrowserHandle } from "@trawl/browser"
 import { closeTemporaryContext, FINGERPRINT, newFreshContext } from "@trawl/browser"
-import type { Cookie, TierResult } from "@trawl/types"
+import type {
+  CapturedResponseEntry,
+  ConsoleLogEntry,
+  Cookie,
+  FaviconEntry,
+  NetworkLogEntry,
+  TierResult,
+} from "@trawl/types"
+import { capturePageFavicons } from "../favicons"
+import { capturePageScreenshot } from "../screenshot"
 import { solvePageCaptchas } from "../solvers"
-import { waitForAkamaiResolution } from "../utils/akamaiWait"
-import { waitForChallengeResolution } from "../utils/challengeWait"
-import { toCookies } from "../utils/cookies"
+import { reportBlocked } from "../utils/blockedEvidence"
+import { attachPageCapture, type CaptureOptions } from "../utils/capture"
+import { routeChallengeWait } from "../utils/challengeRouter"
+import { snapshotChallengeCookies, toCookies } from "../utils/cookies"
 import {
-  detectChallengeType,
+  type ChallengeType,
   hasAkamaiChallenge,
+  hasDataDomeChallenge,
+  hasDdosGuardChallenge,
+  hasDuckDuckGoChallenge,
   hasImpervaChallenge,
   isBlocked,
   isBrowserErrorPage,
   isCloudflarePage,
 } from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
-import { waitForImpervaResolution } from "../utils/impervaWait"
 import { trackMainDocumentResponses } from "../utils/mainResponse"
 import { isHardNetworkFailure } from "../utils/network"
-import { captureResponse, isTextContentType } from "../utils/response"
+import { installOutboundPolicy, type OutboundUrlValidator } from "../utils/outboundPolicy"
+import { isProxyTransportFailure, normalizeProxyError, proxyResponseFailure } from "../utils/proxyFailure"
+import { captureResponse, isHtmlContentType, isTextContentType } from "../utils/response"
 import type { RouteLike } from "../utils/sanitize"
 import { routeContinueOverrides } from "../utils/sanitize"
 
+// Why a wall survived its waiter on a datacenter IP. The clearance token was obtained in
+// every one of these cases, so what is left is the egress IP, not the challenge logic.
+const DATACENTER_BLOCKED_REASONS: Partial<Record<ChallengeType, string>> = {
+  imperva: "datacenter-ip-blocked (imperva sensor cookie obtained but challenge persisted — needs residential proxy)",
+  akamai: "datacenter-ip-blocked (Akamai sensor cookie obtained but challenge persisted — needs residential proxy)",
+  "ddos-guard":
+    "datacenter-ip-blocked (DDoS-Guard clearance cookie obtained but challenge persisted — needs residential proxy)",
+  "aws-waf": "datacenter-ip-blocked (AWS WAF token obtained but challenge persisted — needs residential proxy)",
+  datadome:
+    "datadome-persistent (a datadome cookie was issued but the wall held — check BROWSER_HEADFUL_POOL_SIZE, then try a residential proxy)",
+}
+
+const DEFAULT_DATACENTER_BLOCKED_REASON =
+  "datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)"
+
 export interface Tier3Result extends TierResult {
   tier: 3
+  challenge?: "datadome"
   effectiveUrl?: string
   html?: string
   body?: Uint8Array
@@ -32,6 +62,13 @@ export interface Tier3Result extends TierResult {
   userAgent?: string
   statusCode?: number
   captchasSolved?: string[]
+  screenshot?: string
+  favicons?: FaviconEntry[]
+  consoleLogs?: ConsoleLogEntry[]
+  networkLogs?: NetworkLogEntry[]
+  redirectChain?: string[]
+  capturedResponses?: CapturedResponseEntry[]
+  mhtml?: string
 }
 
 export async function runTier3(
@@ -42,6 +79,10 @@ export async function runTier3(
   extraHeaders?: Record<string, string>,
   method?: string,
   body?: string,
+  validateOutboundUrl?: OutboundUrlValidator,
+  screenshot?: boolean,
+  capture: CaptureOptions = {},
+  ignoreCertificateErrors?: boolean,
 ): Promise<Tier3Result> {
   const start = Date.now()
 
@@ -57,15 +98,19 @@ export async function runTier3(
       proxy: proxyUrl,
       onCreated: handle.noteTemporaryContext,
       requestReplacement: handle.requestBrowserReplacement,
+      ignoreHttpsErrors: ignoreCertificateErrors,
     })
     const page = await freshCtx.newPage()
+    await installOutboundPolicy(page, validateOutboundUrl)
+    const initialCookies = snapshotChallengeCookies(await freshCtx.cookies())
     if ((extraHeaders && Object.keys(extraHeaders).length > 0) || method === "POST") {
       await page.route(url, (route: RouteLike) => {
         route.continue(routeContinueOverrides(route, extraHeaders, method, body))
       })
     }
 
-    const mainResponse = trackMainDocumentResponses(page)
+    const pageCapture = attachPageCapture(page, capture)
+    const mainResponse = trackMainDocumentResponses(page, { redirectChain: capture.redirectChain })
 
     // CF challenges can trigger sub-navigations that throw "navigation interrupted" —
     // we catch those so we can continue. Hard failures (DNS, connection refused) are
@@ -79,34 +124,48 @@ export async function runTier3(
 
     // Abort early on hard network failures — no point running challenge wait
     if (isHardNetworkFailure(gotoErr)) {
-      return { tier: 3, status: "error", durationMs: Date.now() - start, reason: gotoErr.message.split("\n")[0] }
+      return {
+        tier: 3,
+        status: "error",
+        durationMs: Date.now() - start,
+        reason:
+          proxyUrl && isProxyTransportFailure(gotoErr) ? normalizeProxyError(gotoErr) : gotoErr.message.split("\n")[0],
+      }
+    }
+    const earlyProxyFailure = proxyUrl ? proxyResponseFailure(mainResponse.status, mainResponse.headers) : undefined
+    if (earlyProxyFailure) {
+      return { tier: 3, status: "error", durationMs: Date.now() - start, reason: earlyProxyFailure }
     }
     // Otherwise (navigation interrupted by CF redirect) — fall through and keep going
 
     const remaining = maxTimeout - (Date.now() - start)
     const peekHtml = await page.content().catch(() => "")
-    const challengeType = detectChallengeType(peekHtml)
-    const resolution =
-      challengeType === "imperva"
-        ? await waitForImpervaResolution(page, remaining, url)
-        : challengeType === "akamai"
-          ? await waitForAkamaiResolution(page, remaining, url)
-          : await waitForChallengeResolution(page, remaining, url, () => mainResponse.headers)
+    const { challengeType, resolution } = await routeChallengeWait(
+      page,
+      peekHtml,
+      mainResponse.headers,
+      remaining,
+      url,
+      undefined,
+      mainResponse.status,
+      initialCookies,
+    )
 
     if (resolution !== "ok") {
-      return {
-        tier: 3,
-        status: resolution === "ip-blocked" ? "blocked" : "timeout",
-        durationMs: Date.now() - start,
-        reason:
-          resolution === "ip-blocked"
-            ? challengeType === "imperva"
-              ? "datacenter-ip-blocked (imperva sensor cookie obtained but challenge persisted — needs residential proxy)"
-              : challengeType === "akamai"
-                ? "datacenter-ip-blocked (Akamai sensor cookie obtained but challenge persisted — needs residential proxy)"
-                : "datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)"
-            : `${challengeType === "none" ? "cloudflare" : challengeType}-challenge-timeout`,
-      }
+      const status = resolution === "ip-blocked" || resolution === "captcha-required" ? "blocked" : "timeout"
+      const reason =
+        resolution === "captcha-required"
+          ? `${challengeType}-captcha-required`
+          : resolution === "ip-blocked"
+            ? (DATACENTER_BLOCKED_REASONS[challengeType] ?? DEFAULT_DATACENTER_BLOCKED_REASON)
+            : `${challengeType === "none" ? "cloudflare" : challengeType}-challenge-timeout`
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        { tier: 3, status, reason, statusCode: mainResponse.status, html: peekHtml },
+        maxTimeout - (Date.now() - start),
+      )
+      return { tier: 3, status, durationMs: Date.now() - start, reason }
     }
 
     // challengeWait calls waitForLoadState('load') but the CF interstitial iframe can
@@ -123,6 +182,15 @@ export async function runTier3(
       captchasSolved = solveResult.solved
     }
 
+    // Hold the page open for the capture's settle window before reading anything, so a
+    // late XHR the caller is chasing lands in the same evidence as the markup.
+    await pageCapture.settle(maxTimeout - (Date.now() - start))
+
+    // Shot before the html read so the image and the returned html describe the same
+    // moment — the settle wait inside the capture can outlast a slow-clearing challenge.
+    const shot = screenshot ? await capturePageScreenshot(page, maxTimeout - (Date.now() - start)) : undefined
+    const evidence = await pageCapture.drain(maxTimeout - (Date.now() - start))
+
     const html = await page.content()
 
     // Empty shell means the browser got nothing — treat as a load failure
@@ -136,8 +204,11 @@ export async function runTier3(
     // instead of hitting the isHardFail regex (which only matches Chromium ERR_* strings),
     // so we still need to catch the resulting about:neterror page here.
     if (isBrowserErrorPage(html)) {
-      const errMsg =
-        gotoErr instanceof Error ? gotoErr.message.split("\n")[0] : "browser network error (about:neterror)"
+      const errMsg = proxyUrl
+        ? "proxy-connection-failed"
+        : gotoErr instanceof Error
+          ? gotoErr.message.split("\n")[0]
+          : "browser network error (about:neterror)"
       return { tier: 3, status: "error", durationMs: Date.now() - start, reason: errMsg }
     }
 
@@ -145,6 +216,19 @@ export async function runTier3(
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] cloudflare-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "cloudflare-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "cloudflare-persistent" }
     }
 
@@ -152,6 +236,19 @@ export async function runTier3(
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] imperva-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "imperva-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "imperva-persistent" }
     }
 
@@ -159,12 +256,109 @@ export async function runTier3(
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] akamai-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "akamai-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "akamai-persistent" }
     }
 
-    if (isBlocked(mainResponse.status, html)) {
-      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: `http-${mainResponse.status}` }
+    if (hasDdosGuardChallenge(html)) {
+      const pageTitle = await page.title().catch(() => "?")
+      const pageUrl = page.url()
+      console.log(`[tier3] ddos-guard-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "ddos-guard-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "ddos-guard-persistent" }
     }
+
+    if (hasDataDomeChallenge(html)) {
+      const pageTitle = await page.title().catch(() => "?")
+      const pageUrl = page.url()
+      console.log(`[tier3] datadome-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "datadome-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return {
+        tier: 3,
+        status: "blocked",
+        durationMs: Date.now() - start,
+        reason: "datadome-persistent",
+        challenge: "datadome",
+      }
+    }
+
+    if (hasDuckDuckGoChallenge(html)) {
+      const pageTitle = await page.title().catch(() => "?")
+      const pageUrl = page.url()
+      console.log(`[tier3] duckduckgo-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason: "duckduckgo-persistent",
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "duckduckgo-persistent" }
+    }
+
+    if (isBlocked(mainResponse.status, html)) {
+      const reason = `http-${mainResponse.status}`
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 3,
+          status: "blocked",
+          reason,
+          statusCode: mainResponse.status,
+          html,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason }
+    }
+
+    // After the capture is drained, so these fetches never land in the captured
+    // responses, the network log or the MHTML archive.
+    const icons = capture.favicons ? await capturePageFavicons(page, maxTimeout - (Date.now() - start)) : undefined
 
     const cookies: Cookie[] = toCookies(await freshCtx.cookies())
 
@@ -181,13 +375,23 @@ export async function runTier3(
       userAgent: await page.evaluate(() => navigator.userAgent).catch(() => FINGERPRINT.userAgent),
       statusCode: mainResponse.status,
       captchasSolved: captchasSolved.length > 0 ? captchasSolved : undefined,
+      screenshot: shot,
+      favicons: icons,
+      ...evidence,
+      redirectChain: capture.redirectChain ? mainResponse.redirectChain : undefined,
+      mhtml: isHtmlContentType(captured.contentType) ? pageCapture.archive(page.url(), html) : undefined,
     }
   } catch (err) {
     return {
       tier: 3,
       status: "error",
       durationMs: Date.now() - start,
-      reason: err instanceof Error ? err.message : String(err),
+      reason:
+        proxyUrl && isProxyTransportFailure(err)
+          ? normalizeProxyError(err)
+          : err instanceof Error
+            ? err.message
+            : String(err),
     }
   } finally {
     // Closing the context closes all of its pages. If Firefox wedges during cleanup,

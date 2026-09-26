@@ -39,7 +39,7 @@ trawl:
   restart: always
   mem_limit: 3g
   environment:
-    BROWSER_POOL_SIZE: 3
+    BROWSER_POOL_SIZE: 1
   healthcheck:
     test: ["CMD", "curl", "-sf", "http://localhost:8191/health"]
     interval: 30s
@@ -115,28 +115,50 @@ TRAWL and Redis.
 
 | Variable                         | Default              | Description                                                             |
 | -------------------------------- | -------------------- | ----------------------------------------------------------------------- |
-| `BROWSER_POOL_SIZE`              | `3`                  | Warm browsers; supplied minimal/cached Compose files override this to `1` |
+| `BROWSER_POOL_SIZE`              | `1`                  | Warm browsers; raise only for concurrent browser solves                  |
 | `BROWSER_ACQUIRE_TIMEOUT_MS`     | `15000`              | How long `acquire()` polls for a free browser before returning HTTP 429 |
 | `BROWSER_RECYCLE_AFTER_CONTEXTS` | `8`                  | Rolling-replace after this many Tier 3/4 contexts; `0` disables it      |
+| `BROWSER_MAX_CONTENT_PROCESSES`  | `2`                  | Maximum Firefox content processes per browser                           |
+| `SCRAPE_MIN_TIER`                | `1`                  | Lowest scraper tier allowed across every endpoint                       |
+| `SESSION_CACHE_DRIVER`           | `redis`              | Cache backend; minimal Compose defaults to `memory`                      |
 | `REDIS_URL`                      | `redis://redis:6379` | Redis connection (set automatically in compose)                         |
+| `REDIS_SESSION_TTL_SECONDS`      | `3600`               | Lifetime of cached sessions                                             |
+| `MEMORY_SESSION_CACHE_MAX_ENTRIES` | `1000`             | Maximum LRU-bounded entries for the memory driver                       |
+| `REDIS_CONNECT_TIMEOUT_MS`       | `5000`               | Maximum time for each Redis connection attempt                          |
+| `REDIS_RETRY_DELAY_MS`           | `5000`               | Background reconnect delay; `0` disables retry                          |
+| `SCRAPE_PROXY_SELECTION`         | `failover`           | Pool policy: `failover`, `roundrobin`, or `random`                       |
 | `PROXY_URL`                      | —                    | Optional Tier 3 datacenter proxy or pool                                |
 | `RESIDENTIAL_PROXY_URL`          | —                    | Enables Tier 4 proxy escalation                                         |
-| `MITM_PROXY_ENABLED`             | `false`              | Starts the general HTTP/HTTPS proxy                                     |
-| `MITM_PROXY_PORT`                | `8192`               | Proxy listen and published port                                         |
-| `MITM_PROXY_HOST`                | `0.0.0.0`            | Proxy bind address                                                      |
-| `MITM_PROXY_CA_DIR`              | `/data/proxy-ca`     | Persistent root CA directory                                            |
+| `MITM_ENABLED`                   | `false`              | Starts the general HTTP/HTTPS proxy                                     |
+| `MITM_PORT`                      | `8192`               | Proxy listen and published port                                         |
+| `MITM_HOST`                      | `0.0.0.0`            | Proxy bind address                                                      |
+| `MITM_CA_DIR`                    | `/data/proxy-ca`     | Persistent root CA directory                                            |
+| `MITM_ALWAYS_SCRAPE`             | `false`              | Skip proxy Tier 0 and enter the scraper immediately                     |
+| `MCP_ENABLED`                    | `false`              | Enables the Streamable HTTP endpoint at `/mcp`                          |
+| `MCP_ALLOWED_ORIGINS`            | —                    | Comma-separated allowed browser origins                                 |
 
 All supplied Compose files publish port `8192` and mount the `trawl_proxy_ca` volume. The listener
-does not start until `MITM_PROXY_ENABLED=true`. See [Proxy Configuration](/proxy/configuration).
+does not start until `MITM_ENABLED=true`. See [Proxy Configuration](/proxy/configuration).
 
-All supplied Compose files also pass `PROXY_URL`, `PROXY_LIST_FILE`, `RESIDENTIAL_PROXY_URL`, and
-`RESIDENTIAL_PROXY_LIST_FILE` from the local environment or `.env` file. For a single residential
-endpoint:
+All supplied Compose files also pass `SCRAPE_PROXY_SELECTION`, `PROXY_URL`, `PROXY_LIST_FILE`,
+`RESIDENTIAL_PROXY_URL`, and `RESIDENTIAL_PROXY_LIST_FILE` from the local environment or `.env`
+file. For a single residential endpoint:
 
 ```ini
 # .env
 RESIDENTIAL_PROXY_URL=http://user:pass@residential.example.com:8080
 ```
+
+The files explicitly pass every supported TRAWL runtime variable, including browser, screenshot,
+blocked-evidence, diagnostics, redirect, response-capture, STT, and ffmpeg tuning. Docker Compose uses `.env` for
+interpolation but does not otherwise expose arbitrary host variables to the container. Inspect the
+resolved values with `docker compose config` and see the
+[configuration migration guide](/deployment/configuration-migration) when upgrading.
+
+There are two deliberate routing exceptions. `PORT` changes the published host port while the API
+continues listening on container port `8191`. The Redis-backed variants select their bundled
+`redis` service by default. The minimal variant defaults to the bounded in-memory cache; set
+`SESSION_CACHE_DRIVER=redis` with an external `REDIS_URL` to use Redis instead.
 
 For supported endpoint formats, pools, and mounted list files, see
 [Configuration → Proxies](/getting-started/configuration#proxies).

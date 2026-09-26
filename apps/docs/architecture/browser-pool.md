@@ -41,11 +41,11 @@ Both thresholds are configurable via the `BrowserPool` constructor:
 
 ```typescript
 new BrowserPool({
-  poolSize: 3,                // BROWSER_POOL_SIZE (default 3)
+  poolSize: 1,                // BROWSER_POOL_SIZE (default 1)
   acquireTimeoutMs: 15000,    // BROWSER_ACQUIRE_TIMEOUT_MS — 15s default
   pollIntervalMs: 100,        // how often to re-check for an idle browser
   recycleAfterTemporaryContexts: 8,
-  contentProcesses: 2,        // BROWSER_CONTENT_PROCESSES — caps Firefox content procs
+  contentProcesses: 2,        // BROWSER_MAX_CONTENT_PROCESSES — caps Firefox content procs
   stallAfterMs: 180000,       // BROWSER_STALL_TIMEOUT_MS
   closeTimeoutMs: 10000,      // BROWSER_CLOSE_TIMEOUT_MS
   launchTimeoutMs: 90000,     // BROWSER_LAUNCH_TIMEOUT_MS
@@ -77,6 +77,12 @@ Cloudflare detects datacenter Chromium via multiple signals: the CDP leak (`Runt
 
 Camoufox patches Firefox at the C++/Juggler level — fingerprint data (fonts, canvas, WebGL, screen resolution, locale) is spoofed before any JavaScript runs. CF's detection scripts see a real Firefox profile. This is harder to counter than JS-level patches because the data originates from native code, not overridden JS properties.
 
+The published Docker images omit Camoufox's large Windows and macOS font bundles, so their pools
+automatically select Linux profiles only. A custom image built with
+`CAMOUFOX_KEEP_SPOOFED_OS_FONTS=1` retains those bundles and enables the complete
+Windows/macOS/Linux pool; this keeps the claimed OS and measurable fonts consistent in either
+configuration.
+
 ```typescript
 import { Camoufox } from 'camoufox-js'
 
@@ -89,7 +95,7 @@ const browser = await Camoufox({
 
 ## Memory usage
 
-Each Camoufox instance uses ~350–500 MB. With the default pool of 3:
+Each Camoufox instance uses ~350–500 MB. The default pool of 1 is intended for ordinary scraper and Prowlarr workloads:
 
 | Pool size | RAM usage (browser only) |
 | --------- | ------------------------ |

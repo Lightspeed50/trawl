@@ -1,5 +1,5 @@
 # ── Stage 1: install workspace deps (runs natively on build host) ──────────────
-FROM oven/bun:1.3.14 AS deps
+FROM oven/bun:1.4.2 AS deps
 WORKDIR /app
 
 # nodejs/python3/make/g++ are needed to compile better-sqlite3 (camoufox-js dep)
@@ -32,19 +32,20 @@ RUN bun install --frozen-lockfile --production --omit=dev --linker=hoisted \
  && find node_modules -path '*/better-sqlite3*' -name '*.c'   -delete \
  && find node_modules -path '*/better-sqlite3*' -name '*.h'   -delete \
  && find node_modules -path '*/better-sqlite3*' -name '*.map' -delete \
- && rm -rf node_modules/typescript node_modules/bun-types node_modules/@types \
+ && rm -rf node_modules/typescript node_modules/bun-types node_modules/@types node_modules/@typescript \
+ && test -z "$(find node_modules -path '*/@typescript/typescript-*' -print -quit)" \
  && rm -rf node_modules/impit-linux-arm64-musl \
          node_modules/impit-linux-x64-musl \
          node_modules/impit-darwin-* \
          node_modules/impit-win32-*
 
 # ── Stage 2: fetch the Camoufox Firefox binary (pinned version) ─────
-FROM oven/bun:1.3.14 AS camoufox
+FROM oven/bun:1.4.2 AS camoufox
 ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 
-ARG UBO_VERSION=1.73.0
-ARG UBO_AMO_FILE_ID=4940584
-ARG UBO_SHA256=bccc51a773150af4af6e1fd62c7bfdeb7238b79ff2381b998fa9f2e38f64786a
+ARG UBO_VERSION=1.75.0
+ARG UBO_AMO_FILE_ID=5034826
+ARG UBO_SHA256=5b74415860456370644bd80f16125e865b0e6c356bb5dfcfb84069967eaa5287
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -52,21 +53,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Pin the browser release and verify the architecture-specific asset before extracting it.
 # Direct downloads keep builds reproducible and avoid camoufox-js resolving "latest".
 ARG TARGETARCH
+# The pool spoofs a per-browser OS (packages/browser/src/pool.ts maps Win32 -> "windows",
+# MacIntel -> "macos"), and Camoufox spoofs that OS's font list with it. Dropping those
+# bundles therefore leaves a browser advertising fonts whose files are gone: every glyph
+# renders as a tofu box, and the fingerprint is self-inconsistent for anti-bot scoring.
+# Set CAMOUFOX_KEEP_SPOOFED_OS_FONTS=1 to keep them (+891MB) when rendered output matters.
+ARG CAMOUFOX_KEEP_SPOOFED_OS_FONTS=0
 RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN \
     case "$TARGETARCH" in \
-      amd64) ZIP="camoufox-152.0.4-beta.28-lin.x86_64.zip"; SHA256="924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd" ;; \
-      arm64) ZIP="camoufox-152.0.4-beta.28-lin.arm64.zip"; SHA256="3a105a2fc929e80a79b4b7fce2c93ed62c4fb2c877f3c1ed2a5d66a1c4fe968f" ;; \
+      amd64) ZIP="camoufox-152.0.4-beta.30-lin.x86_64.zip"; SHA256="5720d45b894ce1770543de024c6f10d514b38be560fa2dc3226b3d8586caf672" ;; \
+      arm64) ZIP="camoufox-152.0.4-beta.30-lin.arm64.zip"; SHA256="60447260af8bebdb0ec3f2aa72f687b879e5598367303de2e3fdbc7a5be8c124" ;; \
       *) echo "unsupported arch: $TARGETARCH"; exit 1 ;; \
     esac && \
     curl -fsSL \
-      "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/${ZIP}" \
+      "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.30/${ZIP}" \
       -o /tmp/camoufox.zip && \
     echo "${SHA256}  /tmp/camoufox.zip" | sha256sum --check --strict - && \
     unzip -q /tmp/camoufox.zip -d /opt/camoufox && \
     rm /tmp/camoufox.zip && \
-    printf '{"version":"152.0.4","release":"beta.28"}\n' > /opt/camoufox/version.json && \
+    printf '{"version":"152.0.4","release":"beta.30"}\n' > /opt/camoufox/version.json && \
     chmod -R 755 /opt/camoufox && \
-    rm -rf /opt/camoufox/fonts/macos /opt/camoufox/fonts/windows
+    if [ "$CAMOUFOX_KEEP_SPOOFED_OS_FONTS" != "1" ]; then \
+      rm -rf /opt/camoufox/fonts/macos /opt/camoufox/fonts/windows; \
+    fi
 
 # Bake the GeoIP database so camoufox-js never downloads it at runtime.
 # `geoip: true` (packages/browser/src/pool.ts) otherwise makes camoufox-js fetch
@@ -77,12 +86,19 @@ RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN \
 # Baking a verified copy into the image makes startup deterministic and removes the
 # runtime GitHub dependency + first-launch download latency. The size check fails the
 # build if the download is truncated, so a corrupt file can never be baked in.
-ARG GEOLITE_RELEASE=2026.08.16
-ARG GEOLITE_CITY_SHA256=673fb433ffa3db5d175ae235df846d32ae6bb94677de7a625ce51abca4891da8
+# P3TERX/GeoLite.mmdb retains only its two most recent releases, so a pinned tag 404s
+# within days and every build after that fails on curl exit 22 — which is what happened
+# to the 2026.08.07 and 2026.08.19 pins. Track the rolling latest and keep the guarantee
+# that actually matters here (a truncated file is never baked in) with a size floor; the
+# digest of a release that gets deleted cannot be kept current, and it was never a
+# provenance check on MaxMind's data anyway.
+ARG GEOLITE_CITY_MIN_BYTES=50000000
 RUN curl -fsSL \
-      "https://github.com/P3TERX/GeoLite.mmdb/releases/download/${GEOLITE_RELEASE}/GeoLite2-City.mmdb" \
+      "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb" \
       -o /opt/camoufox/GeoLite2-City.mmdb && \
-    echo "${GEOLITE_CITY_SHA256}  /opt/camoufox/GeoLite2-City.mmdb" | sha256sum --check --strict -
+    actual=$(stat -c%s /opt/camoufox/GeoLite2-City.mmdb) && \
+    [ "$actual" -ge "${GEOLITE_CITY_MIN_BYTES}" ] || \
+      { echo "GeoLite2-City.mmdb is $actual bytes, below ${GEOLITE_CITY_MIN_BYTES}" >&2; exit 1; }
 
 # Bake uBlock Origin into Camoufox's expected addon directory. camoufox-js still
 # performs its normal addon registration at startup, but no runtime download or
@@ -121,12 +137,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       libdrm2 libgbm1 \
       libasound2 \
       fonts-liberation \
+      ffmpeg \
+      xvfb \
       ca-certificates \
       curl \
+      tini \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /usr/share/locale /usr/share/doc /usr/share/man
 
-COPY --from=oven/bun:1.3.14  /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=oven/bun:1.4.2  /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=camoufox          /opt/camoufox      /opt/camoufox
 COPY --from=deps              /app/node_modules  /app/node_modules
 
@@ -159,4 +178,5 @@ ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox \
 
 WORKDIR /app
 EXPOSE 8191
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bun", "run", "apps/api/src/index.ts"]

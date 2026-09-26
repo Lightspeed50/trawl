@@ -5,12 +5,17 @@ import {
   type OrchestratorDeps,
   proxySanitizeHeaders,
   RESPONSE_HOP_BY_HOP_HEADERS,
+  ScrapeError,
   scrape,
 } from "@trawl/tiers"
+import { safeUrl } from "../logger"
+import { runLoggedScrape } from "../requestLogging"
 import { MitmCa } from "./ca"
-import { ChallengeCache } from "./challengeCache"
+import { ChallengeCache, type ChallengeMode } from "./challengeCache"
 import { directForwardHttp, directForwardHttps, type ForwardResult } from "./directForward"
-import { responseFromScrapeResult } from "./responsePolicy"
+import { writeResponse, writeResponseFromBuffer, writeResponseFromStream } from "./httpResponse"
+import { registerLocalProxy } from "./localTrust"
+import { responseFromBlockedEvidence, responseFromScrapeResult } from "./responsePolicy"
 
 // General forward proxy with browser-backed challenge escalation. HTTPS is
 // MITM-terminated, so expose it only to clients that trust this instance's CA.
@@ -19,6 +24,9 @@ const MAX_HEADER_BYTES = 64 * 1024
 
 const challengeCache = new ChallengeCache({ ttlMs: 5 * 60 * 1000 })
 
+export const shouldBypassTier0 = (alwaysScrape: boolean | undefined, cachedMode: ChallengeMode | undefined): boolean =>
+  alwaysScrape === true || cachedMode === "cf"
+
 export interface MitmProxyOptions {
   port: number
   caDir: string
@@ -26,6 +34,7 @@ export interface MitmProxyOptions {
   host: string
   maxTier?: 1 | 2 | 3 | 4
   maxTimeout?: number
+  alwaysScrape?: boolean
   debug?: boolean
 }
 
@@ -33,6 +42,7 @@ export interface MitmProxyHandle {
   ca: MitmCa
   server: net.Server
   tlsServers: tls.Server[]
+  unregisterTrust: () => void
 }
 
 export function startMitmProxy(opts: MitmProxyOptions): MitmProxyHandle {
@@ -90,12 +100,14 @@ export function startMitmProxy(opts: MitmProxyOptions): MitmProxyHandle {
     console.log(`[proxy] MITM forward proxy on ${opts.host}:${opts.port}  (CA: ${ca.caCertPath})`)
   })
 
-  return { ca, server, tlsServers }
+  const unregisterTrust = registerLocalProxy({ server, configuredPort: opts.port, ca: ca.caCertPem })
+  return { ca, server, tlsServers, unregisterTrust }
 }
 
 // Graceful shutdown — stops accepting new connections and closes existing ones.
 // Called from lifecycle.ts on SIGTERM/SIGINT before the browser pool shutdown.
 export async function shutdownMitmProxy(handle: MitmProxyHandle, timeoutMs = 5_000): Promise<void> {
+  handle.unregisterTrust()
   const serverClosed = new Promise<void>((resolve) => {
     if (!handle.server.listening) {
       resolve()
@@ -316,7 +328,8 @@ async function proxyRequest(
   // Trust the cache for repeat visits — skip Tier 0 entirely if we recently saw
   // a CF challenge here and jump straight to scrape().
   const cachedMode = challengeCache.get(domain)
-  if (cachedMode === "cf") {
+  if (shouldBypassTier0(opts.alwaysScrape, cachedMode)) {
+    if (opts.debug && opts.alwaysScrape) console.log(`[proxy] Tier 0 bypassed for ${safeUrl(url)} -> scrape()`)
     return await serveViaScrape(stream, url, method, clientHeaders, body, opts)
   }
 
@@ -352,12 +365,12 @@ async function proxyRequest(
   }
 
   if (tier0.mode === "error") {
-    if (opts.debug) console.log(`[proxy] Tier 0 error for ${url}: ${tier0.error.message}`)
+    if (opts.debug) console.log(`[proxy] Tier 0 error for ${safeUrl(url)}: ${tier0.error.message}`)
     return await serveViaScrape(stream, url, method, clientHeaders, body, opts)
   }
 
   if (tier0.mode === "stream") {
-    if (opts.debug) console.log(`[proxy] Tier 0 stream for ${url} -> ${tier0.status}`)
+    if (opts.debug) console.log(`[proxy] Tier 0 stream for ${safeUrl(url)} -> ${tier0.status}`)
     challengeCache.set(domain, "direct")
     writeResponseFromStream(
       stream,
@@ -372,7 +385,7 @@ async function proxyRequest(
   }
 
   if (tier0.challengeDetected) {
-    if (opts.debug) console.log(`[proxy] Tier 0 challenge for ${url} -> escalating to scrape()`)
+    if (opts.debug) console.log(`[proxy] Tier 0 challenge for ${safeUrl(url)} -> escalating to scrape()`)
     challengeCache.set(domain, "cf")
     return await serveViaScrape(stream, url, method, clientHeaders, body, opts)
   }
@@ -384,7 +397,22 @@ async function proxyRequest(
 // Tier 1+ fallback: reissue through the existing browser-backed scrape pipeline.
 // Used when Tier 0 detects a challenge, encounters a network error, or sees the
 // domain in challengeCache as "cf".
-async function serveViaScrape(
+function terminalBlockedEvidence(error: ScrapeError) {
+  const evidence = error.blockedEvidence
+  const terminal = error.timings.at(-1)
+  if (
+    !evidence?.html ||
+    !terminal ||
+    terminal.tier !== evidence.tier ||
+    terminal.status !== evidence.status ||
+    terminal.reason !== evidence.reason
+  ) {
+    return undefined
+  }
+  return evidence
+}
+
+export async function serveViaScrape(
   stream: net.Socket,
   url: string,
   method: string,
@@ -397,7 +425,8 @@ async function serveViaScrape(
       writeResponse(stream, 400, Buffer.from(`unsupported method: ${method}`), "text/plain; charset=utf-8")
       return
     }
-    const scrapeResult = await scrape(
+    const scrapeResult = await runLoggedScrape(
+      "proxy",
       {
         url,
         method,
@@ -405,8 +434,10 @@ async function serveViaScrape(
         body: body?.toString("utf8"),
         maxTier: opts.maxTier,
         maxTimeout: opts.maxTimeout,
+        blockedEvidence: true,
       },
       opts.deps,
+      scrape,
     )
     if (opts.debug)
       console.log(
@@ -419,9 +450,9 @@ async function serveViaScrape(
       }
     }
 
-    // Browser tiers expose both the original navigation response and the
-    // rendered DOM. For HTML, the latter is the solved page behind the challenge.
-    // Binary responses retain their exact raw bytes.
+    // Browser tiers expose decoded navigation bodies and, for HTML, the rendered
+    // solved DOM. responseFromScrapeResult removes upstream representation
+    // headers that no longer describe those bytes; Tier 1 remains byte-faithful.
     const response = responseFromScrapeResult(scrapeResult)
     if (opts.debug) {
       console.log(
@@ -436,7 +467,19 @@ async function serveViaScrape(
       response.contentType,
     )
   } catch (err) {
-    console.error("[proxy] scrape() failed for", url, err instanceof Error ? err.message : err)
+    const evidence = err instanceof ScrapeError ? terminalBlockedEvidence(err) : undefined
+    if (evidence) {
+      const response = responseFromBlockedEvidence(evidence)
+      if (opts.debug) {
+        console.log(
+          `[proxy] scrape() caught terminal challenge for ${url} (reason: ${evidence.reason}) -> passing through blocked evidence (${response.statusCode})`,
+        )
+      }
+      writeResponseFromBuffer(stream, response.statusCode, response.headers, response.body, response.contentType)
+      return
+    }
+
+    console.error("[proxy] scrape() failed for", safeUrl(url), err instanceof Error ? err.message : err)
     writeResponseFromBuffer(
       stream,
       502,
@@ -535,77 +578,6 @@ async function handlePlainHttp(clientSocket: net.Socket, first: Buffer, opts: Mi
   })
 }
 
-function writeResponse(sock: net.Socket, status: number, body: Buffer, contentType = "text/html; charset=utf-8"): void {
-  const head =
-    `HTTP/1.1 ${status} ${reason(status)}\r\n` +
-    `Content-Type: ${contentType}\r\n` +
-    `Content-Length: ${body.length}\r\n` +
-    "Connection: close\r\n\r\n"
-  sock.write(head)
-  sock.write(body)
-  sock.end()
-}
-
-// Buffered responses preserve end-to-end headers and derive a fresh body length.
-function writeResponseFromBuffer(
-  sock: net.Socket,
-  status: number,
-  upstreamHeaders: Record<string, string>,
-  body: Buffer,
-  fallbackContentType: string,
-): void {
-  const ct = upstreamHeaders["content-type"] ?? fallbackContentType
-  const headerLines: string[] = [`HTTP/1.1 ${status} ${reason(status)}`]
-  let emittedContentType = false
-  for (const [name, value] of Object.entries(upstreamHeaders)) {
-    const lower = name.toLowerCase()
-    if (RESPONSE_HOP_BY_HOP_HEADERS.has(lower)) continue
-    if (lower === "content-length") continue
-    if (lower === "content-type") emittedContentType = true
-    headerLines.push(`${name}: ${value}`)
-  }
-  if (!emittedContentType) headerLines.push(`Content-Type: ${ct}`)
-  headerLines.push(`Content-Length: ${body.length}`)
-  headerLines.push("Connection: close")
-  sock.write(`${headerLines.join("\r\n")}\r\n\r\n`)
-  sock.write(body)
-  sock.end()
-}
-
-// Streamed responses retain upstream transfer framing.
-function writeResponseFromStream(
-  sock: net.Socket,
-  status: number,
-  upstreamHeaders: Record<string, string>,
-  upstreamSocket: net.Socket,
-  fallbackContentType: string,
-  requestBodyLength: number,
-  prefix?: Buffer,
-): void {
-  const headerLines: string[] = [`HTTP/1.1 ${status} ${reason(status)}`]
-  let emittedContentType = false
-  for (const [name, value] of Object.entries(upstreamHeaders)) {
-    const lower = name.toLowerCase()
-    // The streamed bytes retain upstream HTTP/1.1 chunk framing, so preserve
-    // Transfer-Encoding. Other hop-by-hop headers remain connection-local.
-    if (RESPONSE_HOP_BY_HOP_HEADERS.has(lower) && lower !== "transfer-encoding") continue
-    if (lower === "content-type") emittedContentType = true
-    headerLines.push(`${name}: ${value}`)
-  }
-  if (!emittedContentType) headerLines.push(`Content-Type: ${fallbackContentType}`)
-  if (requestBodyLength > 0) headerLines.push(`X-Forwarded-Body-Length: ${requestBodyLength}`)
-  headerLines.push("Connection: close")
-  // Write HTTP headers first, then prefix body bytes (which arrived in the same
-  // TCP segment as upstream's response headers), then pipe the rest of the body.
-  sock.write(`${headerLines.join("\r\n")}\r\n\r\n`)
-  if (prefix?.length) sock.write(prefix)
-  upstreamSocket.pipe(sock)
-  sock.on("error", () => upstreamSocket.destroy())
-  upstreamSocket.on("error", () => sock.destroy())
-  upstreamSocket.on("end", () => sock.end())
-  upstreamSocket.on("close", () => sock.end())
-}
-
 function parseHeaders(lines: string[]): Record<string, string> {
   const out: Record<string, string> = {}
   for (const line of lines) {
@@ -613,15 +585,4 @@ function parseHeaders(lines: string[]): Record<string, string> {
     if (idx > 0) out[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim()
   }
   return out
-}
-
-function reason(status: number): string {
-  const map: Record<number, string> = {
-    200: "OK",
-    403: "Forbidden",
-    404: "Not Found",
-    500: "Internal Server Error",
-    502: "Bad Gateway",
-  }
-  return map[status] ?? "OK"
 }

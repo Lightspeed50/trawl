@@ -51,6 +51,7 @@ export default defineConfig({
           { text: "Prowlarr", link: "/integrations/prowlarr" },
           { text: "Jackett", link: "/integrations/jackett" },
           { text: "*arr Apps", link: "/integrations/arr-apps" },
+          { text: "MCP", link: "/integrations/mcp" },
         ],
       },
       {
@@ -86,6 +87,7 @@ export default defineConfig({
         items: [
           { text: "Docker Compose", link: "/deployment/docker-compose" },
           { text: "Standalone Containers", link: "/deployment/standalone" },
+          { text: "Configuration Migration", link: "/deployment/configuration-migration" },
           { text: "Troubleshooting", link: "/deployment/troubleshooting" },
         ],
       },

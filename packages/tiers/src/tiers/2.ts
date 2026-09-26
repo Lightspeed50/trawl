@@ -1,16 +1,36 @@
 import type { BrowserHandle } from "@trawl/browser"
-import type { Cookie, SessionData, TierResult } from "@trawl/types"
+import type {
+  CapturedResponseEntry,
+  ConsoleLogEntry,
+  Cookie,
+  FaviconEntry,
+  NetworkLogEntry,
+  SessionData,
+  TierResult,
+} from "@trawl/types"
+import { capturePageFavicons } from "../favicons"
+import { capturePageScreenshot } from "../screenshot"
 import { solvePageCaptchas } from "../solvers"
+import { reportBlocked } from "../utils/blockedEvidence"
+import { attachPageCapture, type CaptureOptions } from "../utils/capture"
 import { normalizeSameSite, toCookies } from "../utils/cookies"
-import { hasAkamaiChallenge, isBlocked, isBrowserErrorPage, isCloudflarePage } from "../utils/detect"
+import {
+  hasAkamaiChallenge,
+  hasDataDomeChallenge,
+  isBlocked,
+  isBrowserErrorPage,
+  isCloudflarePage,
+} from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
 import { trackMainDocumentResponses } from "../utils/mainResponse"
-import { captureResponse, isTextContentType } from "../utils/response"
+import { installOutboundPolicy, type OutboundUrlValidator } from "../utils/outboundPolicy"
+import { captureResponse, isHtmlContentType, isTextContentType } from "../utils/response"
 import type { RouteLike } from "../utils/sanitize"
 import { routeContinueOverrides } from "../utils/sanitize"
 
 export interface Tier2Result extends TierResult {
   tier: 2
+  challenge?: "datadome"
   effectiveUrl?: string
   html?: string
   body?: Uint8Array
@@ -19,6 +39,13 @@ export interface Tier2Result extends TierResult {
   cookies?: Cookie[]
   statusCode?: number
   captchasSolved?: string[]
+  screenshot?: string
+  favicons?: FaviconEntry[]
+  consoleLogs?: ConsoleLogEntry[]
+  networkLogs?: NetworkLogEntry[]
+  redirectChain?: string[]
+  capturedResponses?: CapturedResponseEntry[]
+  mhtml?: string
 }
 
 export async function runTier2(
@@ -29,6 +56,9 @@ export async function runTier2(
   extraHeaders?: Record<string, string>,
   method?: string,
   body?: string,
+  validateOutboundUrl?: OutboundUrlValidator,
+  screenshot?: boolean,
+  capture: CaptureOptions = {},
 ): Promise<Tier2Result> {
   const start = Date.now()
   const activeContext = handle.context
@@ -36,6 +66,7 @@ export async function runTier2(
 
   try {
     page = await activeContext.newPage()
+    await installOutboundPolicy(page, validateOutboundUrl)
 
     // addCookies replaces cookies by name+domain+path, so no need to clearCookies first.
     // Keeping the context's CF cookies (cf_clearance, __cf_bm) intact means CF sees a
@@ -61,7 +92,8 @@ export async function runTier2(
       })
     }
 
-    const mainResponse = trackMainDocumentResponses(page)
+    const pageCapture = attachPageCapture(page, capture)
+    const mainResponse = trackMainDocumentResponses(page, { redirectChain: capture.redirectChain })
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: maxTimeout })
     await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {})
@@ -78,17 +110,78 @@ export async function runTier2(
     }
 
     if (isCloudflarePage(html, mainResponse.headers)) {
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 2,
+          status: "blocked",
+          reason: "session-expired",
+          statusCode: mainResponse.status,
+          html,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 2, status: "blocked", durationMs: Date.now() - start, reason: "session-expired" }
     }
 
     // A cached session that lands back on Akamai's interstitial is stale — force a
     // fresh Tier-3 solve rather than returning the ~2KB challenge stub as content.
     if (hasAkamaiChallenge(html)) {
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 2,
+          status: "blocked",
+          reason: "akamai-session-expired",
+          statusCode: mainResponse.status,
+          html,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 2, status: "blocked", durationMs: Date.now() - start, reason: "akamai-session-expired" }
     }
 
+    // Same reasoning for DataDome: isBlocked() already catches the 403, but a stale
+    // `datadome` cookie is worth telling apart from any other 403 in the logs.
+    if (hasDataDomeChallenge(html)) {
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 2,
+          status: "blocked",
+          reason: "datadome-session-expired",
+          statusCode: mainResponse.status,
+          html,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return {
+        tier: 2,
+        status: "blocked",
+        durationMs: Date.now() - start,
+        reason: "datadome-session-expired",
+        challenge: "datadome",
+      }
+    }
+
     if (isBlocked(mainResponse.status, html)) {
-      return { tier: 2, status: "blocked", durationMs: Date.now() - start, reason: `http-${mainResponse.status}` }
+      const reason = `http-${mainResponse.status}`
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 2,
+          status: "blocked",
+          reason,
+          statusCode: mainResponse.status,
+          html,
+        },
+        maxTimeout - (Date.now() - start),
+      )
+      return { tier: 2, status: "blocked", durationMs: Date.now() - start, reason }
     }
 
     // Attempt to solve any embedded captcha widgets (Turnstile, reCAPTCHA, hCaptcha).
@@ -100,10 +193,36 @@ export async function runTier2(
       captchasSolved = result.solved
     }
 
+    // Hold the page open for the capture's settle window before reading anything, so a
+    // late XHR the caller is chasing lands in the same evidence as the markup.
+    await pageCapture.settle(maxTimeout - (Date.now() - start))
+
+    // Shot before the html read so the image and the returned html describe the same
+    // moment — the settle wait inside the capture can outlast a slow-clearing challenge.
+    const shot = screenshot ? await capturePageScreenshot(page, maxTimeout - (Date.now() - start)) : undefined
+    const evidence = await pageCapture.drain(maxTimeout - (Date.now() - start))
+
     const finalHtml = await page.content()
     if (isCloudflarePage(finalHtml, mainResponse.headers)) {
+      await reportBlocked(
+        page,
+        capture.blockedEvidence,
+        {
+          tier: 2,
+          status: "blocked",
+          reason: "session-expired",
+          statusCode: mainResponse.status,
+          html: finalHtml,
+          screenshot: shot,
+        },
+        maxTimeout - (Date.now() - start),
+      )
       return { tier: 2, status: "blocked", durationMs: Date.now() - start, reason: "session-expired" }
     }
+
+    // After the capture is drained, so these fetches never land in the captured
+    // responses, the network log or the MHTML archive.
+    const icons = capture.favicons ? await capturePageFavicons(page, maxTimeout - (Date.now() - start)) : undefined
 
     const cookies: Cookie[] = toCookies(await activeContext.cookies())
 
@@ -121,6 +240,11 @@ export async function runTier2(
       cookies,
       statusCode: mainResponse.status,
       captchasSolved: captchasSolved.length > 0 ? captchasSolved : undefined,
+      screenshot: shot,
+      favicons: icons,
+      ...evidence,
+      redirectChain: capture.redirectChain ? mainResponse.redirectChain : undefined,
+      mhtml: isHtmlContentType(captured.contentType) ? pageCapture.archive(page.url(), finalHtml) : undefined,
     }
   } catch (err) {
     return {

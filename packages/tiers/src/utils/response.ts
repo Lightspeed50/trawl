@@ -2,6 +2,7 @@ export interface MinimalResponse {
   url(): string
   status(): number
   headers(): Record<string, string>
+  allHeaders(): Promise<Record<string, string>>
   body(): Promise<Buffer | Uint8Array>
 }
 
@@ -18,11 +19,17 @@ export const isTextContentType = (contentType: string): boolean => {
   return normalized.startsWith("text/") || TEXT_CONTENT_MARKERS.some((marker) => normalized.includes(marker))
 }
 
+export const isHtmlContentType = (contentType: string | undefined): boolean => {
+  if (!contentType) return false
+  const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase()
+  return mediaType === "text/html" || mediaType === "application/xhtml+xml"
+}
+
 export const captureResponse = async (response?: MinimalResponse): Promise<CapturedResponse> => {
   if (!response) return {}
   try {
     const raw = await response.body()
-    const responseHeaders = response.headers()
+    const responseHeaders = await response.allHeaders()
     return {
       body: raw instanceof Uint8Array ? raw : new Uint8Array(raw),
       responseHeaders,

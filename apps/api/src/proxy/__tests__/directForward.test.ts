@@ -15,7 +15,19 @@ const chunked = (...chunks: Uint8Array[]): ReadableStream<Uint8Array> =>
   })
 
 const fetchFixture = (req: Request): Response => {
-  const { pathname } = new URL(req.url)
+  const { pathname, searchParams } = new URL(req.url)
+  if (pathname === "/cookies") {
+    const headers = new Headers({ "Content-Type": "text/html" })
+    headers.append("Set-Cookie", "session=one; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/")
+    headers.append("Set-Cookie", "clearance=two; Path=/; HttpOnly")
+    return new Response("cookies", { headers })
+  }
+  if (pathname === "/cookie-video") {
+    const headers = new Headers({ "Content-Type": "video/mp4" })
+    headers.append("Set-Cookie", "session=one; Path=/")
+    headers.append("Set-Cookie", "clearance=two; Path=/; Secure")
+    return new Response(Buffer.from([0, 1, 2, 3]), { headers })
+  }
   if (pathname === "/chunked-html")
     return new Response(
       chunked(Buffer.from("<!doctype html><title>Normal page</title>"), Buffer.from("<p>small response</p>")),
@@ -37,6 +49,16 @@ const fetchFixture = (req: Request): Response => {
     return new Response('<html><div id="sec-if-cpt-container" class="behavioral-content"></div></html>', {
       headers: { "Content-Type": "text/html; charset=utf-8" },
     })
+  if (pathname === "/duckduckgo-challenge")
+    return new Response(
+      `<form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html"><div data-testid="anomaly-modal"></div></form><p>${"x".repeat(5000)}</p>`,
+      { status: Number(searchParams.get("status") ?? 202), headers: { "Content-Type": "text/html; charset=utf-8" } },
+    )
+  if (pathname === "/altcha-challenge")
+    return new Response(
+      `<!DOCTYPE html><html><head><title>Captcha</title></head><body><div class="header">...</div><p>${"x".repeat(5000)}</p><div class="captcha-wrap"><p>JavaScript is required</p></div><script type="module" src="/js/page_specific/altcha.js"></script></body></html>`,
+      { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    )
   if (pathname === "/video")
     return new Response(chunked(Buffer.from([0, 1, 2, 3]), Buffer.from([4, 5, 6, 7])), {
       headers: { "Content-Type": "video/mp4" },
@@ -139,6 +161,23 @@ describe("directForwardHttp — Range / 206 Partial Content", () => {
 })
 
 describe("directForwardHttp — buffered by default", () => {
+  test("preserves repeated Set-Cookie fields using the internal newline convention", async () => {
+    const result = await directForwardHttp({ url: `${baseUrl}/cookies`, method: "GET", headers: {} })
+    expect(result.mode).toBe("buffer")
+    if (result.mode !== "buffer") return
+    expect(result.headers["set-cookie"]).toBe(
+      "session=one; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/\nclearance=two; Path=/; HttpOnly",
+    )
+  })
+
+  test("preserves repeated Set-Cookie fields on streamed responses", async () => {
+    const result = await directForwardHttp({ url: `${baseUrl}/cookie-video`, method: "GET", headers: {} })
+    expect(result.mode).toBe("stream")
+    if (result.mode !== "stream") return
+    expect(result.headers["set-cookie"]).toBe("session=one; Path=/\nclearance=two; Path=/; Secure")
+    result.socket.destroy()
+  })
+
   test("skips 103 Early Hints and escalates cf-mitigated without waiting for an open body", async () => {
     const sockets = new Set<net.Socket>()
     const hangingServer = net.createServer((socket) => {
@@ -176,6 +215,72 @@ describe("directForwardHttp — buffered by default", () => {
     }
   })
 
+  test("escalates a DataDome block from its header before waiting for an open body", async () => {
+    const sockets = new Set<net.Socket>()
+    const hangingServer = net.createServer((socket) => {
+      sockets.add(socket)
+      socket.once("close", () => sockets.delete(socket))
+      socket.write("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nX-DD-B: 1\r\nConnection: keep-alive\r\n\r\n")
+    })
+    hangingServer.listen(0, "127.0.0.1")
+    await once(hangingServer, "listening")
+    const address = hangingServer.address()
+    if (!address || typeof address === "string") throw new Error("test server did not bind a TCP port")
+
+    try {
+      const startedAt = performance.now()
+      const result = await directForwardHttp({
+        url: `http://127.0.0.1:${address.port}/challenge`,
+        method: "GET",
+        headers: {},
+        timeoutMs: 2_000,
+      })
+      expect(performance.now() - startedAt).toBeLessThan(500)
+      expect(result.mode).toBe("buffer")
+      if (result.mode !== "buffer") return
+      expect(result.status).toBe(403)
+      expect(result.challengeDetected).toBe(true)
+      expect(result.body.length).toBe(0)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve, reject) => hangingServer.close((error) => (error ? reject(error) : resolve())))
+    }
+  })
+
+  test("escalates an AWS WAF Challenge header before waiting for an open body", async () => {
+    const sockets = new Set<net.Socket>()
+    const hangingServer = net.createServer((socket) => {
+      sockets.add(socket)
+      socket.once("close", () => sockets.delete(socket))
+      socket.write(
+        "HTTP/1.1 202 Accepted\r\nContent-Type: text/html\r\nX-AmZn-WaF-aCtIoN: Challenge\r\nConnection: keep-alive\r\n\r\n",
+      )
+    })
+    hangingServer.listen(0, "127.0.0.1")
+    await once(hangingServer, "listening")
+    const address = hangingServer.address()
+    if (!address || typeof address === "string") throw new Error("test server did not bind a TCP port")
+
+    try {
+      const startedAt = performance.now()
+      const result = await directForwardHttp({
+        url: `http://127.0.0.1:${address.port}/challenge`,
+        method: "GET",
+        headers: {},
+        timeoutMs: 2_000,
+      })
+      expect(performance.now() - startedAt).toBeLessThan(500)
+      expect(result.mode).toBe("buffer")
+      if (result.mode !== "buffer") return
+      expect(result.status).toBe(202)
+      expect(result.challengeDetected).toBe(true)
+      expect(result.body.length).toBe(0)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve, reject) => hangingServer.close((error) => (error ? reject(error) : resolve())))
+    }
+  })
+
   test("buffers and de-chunks small HTML instead of treating it as a stream", async () => {
     const result = await directForwardHttp({
       url: `${baseUrl}/chunked-html`,
@@ -202,6 +307,23 @@ describe("directForwardHttp — buffered by default", () => {
     expect(result.body.toString()).toContain("Just a moment")
   })
 
+  test("detects large DuckDuckGo anomaly challenges at 200 and 202", async () => {
+    for (const status of [200, 202]) {
+      const result = await directForwardHttp({
+        url: `${baseUrl}/duckduckgo-challenge?status=${status}`,
+        method: "POST",
+        headers: {},
+      })
+
+      expect(result.mode).toBe("buffer")
+      if (result.mode !== "buffer") continue
+      expect(result.status).toBe(status)
+      expect(result.body.length).toBeGreaterThan(3000)
+      expect(result.challengeDetected).toBe(true)
+      expect(result.body.toString()).toContain("anomaly-modal")
+    }
+  })
+
   test("detects a challenge in a compressed HTML response", async () => {
     const result = await directForwardHttp({
       url: `${baseUrl}/gzip-challenge`,
@@ -226,6 +348,21 @@ describe("directForwardHttp — buffered by default", () => {
     if (result.mode !== "buffer") return
     expect(result.status).toBe(200)
     expect(result.challengeDetected).toBe(true)
+  })
+
+  test("detects a 200 ALTCHA dynamic challenge wall positioned past 4 KiB", async () => {
+    const result = await directForwardHttp({
+      url: `${baseUrl}/altcha-challenge`,
+      method: "GET",
+      headers: {},
+    })
+
+    expect(result.mode).toBe("buffer")
+    if (result.mode !== "buffer") return
+    expect(result.status).toBe(200)
+    expect(result.body.length).toBeGreaterThan(4096)
+    expect(result.challengeDetected).toBe(true)
+    expect(result.body.toString()).toContain("altcha.js")
   })
 
   test("streams explicit video responses", async () => {

@@ -224,10 +224,11 @@ async function readHttpResponse(
     const name = line.slice(0, idx).trim().toLowerCase()
     const value = line.slice(idx + 1).trim()
     if (!name) continue
-    // Keep first occurrence for multi-value headers; Set-Cookie is the
-    // common case where only the first makes it through. Caller can read
-    // raw lines via the set-cookie header if needed.
-    if (headers[name] === undefined) headers[name] = value
+    if (name === "set-cookie" && headers[name] !== undefined) {
+      headers[name] += `\n${value}`
+    } else if (headers[name] === undefined) {
+      headers[name] = value
+    }
   }
 
   const contentType = headers["content-type"] ?? "application/octet-stream"
@@ -239,7 +240,13 @@ async function readHttpResponse(
   // an unbounded/keep-alive response body to finish (or hit the 30s socket timeout).
   // Body-based detection below remains the fallback for challenge variants that
   // do not send this header.
-  if (!skipChallengeDetection && detectChallengeType("", headers) === "cloudflare-interstitial") {
+  const headerChallengeType = detectChallengeType("", headers, status)
+  if (
+    !skipChallengeDetection &&
+    (headerChallengeType === "cloudflare-interstitial" ||
+      headerChallengeType === "aws-waf" ||
+      headerChallengeType === "datadome")
+  ) {
     socket.destroy()
     return {
       mode: "buffer",
@@ -282,8 +289,9 @@ async function readHttpResponse(
       return { mode: "error", error: err instanceof Error ? err : new Error(String(err)) }
     }
     const previewText = decodeForInspection(body, headers["content-encoding"])
-    const challengeType = detectChallengeType(previewText, headers)
-    const challengeDetected = !skipChallengeDetection && isChallengeWall(status, body.length, challengeType)
+    const challengeType = detectChallengeType(previewText, headers, status)
+    const challengeDetected =
+      !skipChallengeDetection && isChallengeWall(status, body.length, challengeType, previewText)
     return {
       mode: "buffer",
       status,
@@ -339,8 +347,8 @@ async function readHttpResponse(
 
   // Challenge detection on the buffered body. Bounded preview keeps this cheap.
   const previewText = decodeForInspection(body.subarray(0, offset), headers["content-encoding"])
-  const challengeType = detectChallengeType(previewText, headers)
-  const challengeDetected = !skipChallengeDetection && isChallengeWall(status, body.length, challengeType)
+  const challengeType = detectChallengeType(previewText, headers, status)
+  const challengeDetected = !skipChallengeDetection && isChallengeWall(status, body.length, challengeType, previewText)
 
   return {
     mode: "buffer",
@@ -521,5 +529,5 @@ function decodeForInspection(body: Buffer, contentEncoding?: string): string {
   } catch {
     // If an upstream mislabeled or truncated the encoding, inspect the raw bytes.
   }
-  return decoded.toString("utf8", 0, Math.min(decoded.length, 4096))
+  return decoded.toString("utf8", 0, Math.min(decoded.length, 65536))
 }

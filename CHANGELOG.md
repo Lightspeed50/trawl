@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.5] - 2026-09-24
+
+### Changed
+
+- Bump all application and internal package versions to `1.6.5` and refresh all dependencies to their latest mutually compatible releases.
+- Default the browser pool to one warm Camoufox instance for memory-efficient Prowlarr and ordinary scraper deployments; larger pools remain opt-in for concurrent browser solves (#164).
+- Emit correlated request, tier, success, failure, and memory-pressure logs at the default `info` level. Add `LOG_LEVEL` controls, redact sensitive request metadata from correlated entries, and expose cgroup memory/OOM diagnostics on `/health` (#164).
+
+## [1.6.4] - 2026-09-23
+
+### Changed
+- Bump all application and internal package versions to `1.6.4`.
+
+### Fixed
+- Trust the active local TRAWL MITM proxy CA only for requests explicitly routed back through that listener, fixing `/v1` and `/scrape` self-proxy failures without changing system trust or weakening TLS for other proxies (#160).
+
+## [1.6.3] - 2026-09-22
+
+### Changed
+- Bump all application and internal package versions to `1.6.3`.
+- Refresh compatible transitive dependencies and Redis to `8.10.2`; all direct package, browser, container, and CI dependencies are at their latest mutually compatible versions.
+
+### Added
+- Optional invalid-certificate loading: `ignoreCertificateErrors: true` on `POST /scrape` loads a page whose TLS certificate fails verification (expired, self-signed, issued for another host) instead of failing the fetch, and reports why verification failed in `ScrapeResult.certificateError`. Off by default and per request: Tier 1 retries only the failed TLS hop without replaying successful requests, Tiers 3 and 4 set it on the temporary context created for that one request, and the pooled contexts every other caller uses stay verified. Tier 2 is skipped for these requests — it replays its session inside the shared pool context, whose TLS policy cannot be changed per request — and is reported as `skipped` in `timings`. Because an unverified connection no longer proves whose page came back, an opted-in request also runs a crossed-landing guard: a scrape that ends on a host the requested URL is not part of is re-checked with a plain HTTP fetch over the same egress, and only when that probe stays on the requested host is the landing refused (`crossed-landing on <host>` in `timings`, the ladder moving to the next tier, and a terminal error naming the refused landing when no tier returns an uncrossed page). An inconclusive or equally off-host probe keeps the page, and the same off-host landing reached from two independent egresses is accepted as a browser-only redirect. The probe shares the request's remaining `maxTimeout` across every redirect and validates every hop against the configured outbound policy.
+- Optional favicon collection: `favicons: true` on `POST /scrape` returns the page's icons in `ScrapeResult.favicons` (`url`, `contentType`, base64 `data`, or `error`). A page may declare several icons — size and device variants, `apple-touch-icon`, `mask-icon` — and the browser renders exactly one; this returns the whole declared set plus the apex `/favicon.ico`, resolved against `document.baseURI` and de-duplicated. Each is fetched with `fetch()` **in page context**, so the requests carry the origin's cookies and the session's challenge clearance rather than arriving as an unauthenticated stranger a bot wall answers 403. Off by default — without the flag nothing is resolved and no request is made. Icon count, streamed body bytes, metadata length, per-fetch time and total collection time are bounded and tunable via `FAVICON_*`, and the request's own remaining `maxTimeout` caps the last of them. An icon that could not be read comes back with its own `error` rather than vanishing, and collection runs after the response listeners are drained so these fetches never land in `networkLogs`, `capturedResponses`, `timings` or the MHTML archive.
+
+### Fixed
+- Preserve encoded Tier 1 response bodies so MITM clients do not attempt to decompress already-decoded content (#152).
+
+## [1.6.2] - 2026-09-17
+
+### Changed
+- Bump all application and internal package versions to `1.6.2`.
+- Refresh Biome, nginx, and uBlock Origin to their latest mutually compatible releases.
+
+### Fixed
+- Return terminal challenge HTML and its upstream status through the MITM proxy, allowing downstream clients to distinguish blocked targets from gateway failures while retaining `502 Bad Gateway` for infrastructure errors (#147).
+
+## [1.6.1] - 2026-09-16
+
+### Changed
+- Bump all application and internal package versions to `1.6.1`.
+- Publish rolling nightly images from the latest verified `dev` revision every day at 02:00 UTC instead of on stable `main` pushes, allow manual nightly dispatch, and cancel superseded nightly runs (#137).
+- Stop publishing the optional `-fonts` release flavor automatically. Published images remain compact and use Linux fingerprints; deployments needing the complete Windows/macOS/Linux font pool can build with `CAMOUFOX_KEEP_SPOOFED_OS_FONTS=1`.
+
+### Fixed
+- Detect dynamic ALTCHA challenge pages beyond the former 4 KiB inspection window, classify only strong interstitial markers as walls, and keep post-verification settling within the request deadline (#140).
+- Resolve destination hostnames through configured SOCKS5 proxies instead of the container's local DNS, preventing DNS leaks and restoring access when the local resolver blocks or poisons the target domain (#136).
+
+## [1.6.0] - 2026-09-15
+
+### Changed
+- Bump all application and internal package versions to `1.6.0`.
+- Refresh compatible runtime, browser, build, and container dependencies for the release.
+
+### Added
+- Add `SCRAPE_PROXY_SELECTION=failover|roundrobin|random` for Tier 3 and Tier 4 proxy pools. The default preserves sticky per-domain challenge sessions, while opt-in round-robin or random selection can spread proxy-backed scrape requests across healthy endpoints (#129).
+- Add `SCRAPE_MIN_TIER=1|2|3|4` as a deployment-wide floor for `/scrape`, FlareSolverr `/v1`, MCP, and MITM scraper fallback requests. This lets operators bypass plain HTTP, cached sessions, or fresh direct browser solves when an earlier attempt would poison a target's fingerprint or bypass the intended proxy tier (#128).
+- Optional MHTML archive: `mhtml: true` on `POST /scrape` returns a bounded `multipart/related` archive of successful HTML pages from browser tiers. The rendered document is followed by the safely readable stylesheets, scripts, images, and fonts observed during the normal page lifetime; omitted resources are reported inside the archive (#125).
+- Optional `blockedEvidence` diagnostics for terminal `/scrape` failures, returning bounded challenge-wall HTML and an optional screenshot without changing the HTTP 500 failure semantics. Evidence covers all browser challenge detectors, stays within the request budget, and is omitted unless explicitly requested (#124).
+- Publish a `-fonts` flavor of every release image (`:X.Y.Z-fonts`, `:latest-fonts`) with the complete spoofed Windows/macOS font bundles. Compact images now limit their runtime fingerprint pool to Linux when those bundles are absent, preventing rendered output and font probes from contradicting the advertised OS (#123).
+- Pluggable session cache driver selectable via `SESSION_CACHE_DRIVER` (`redis` default, bounded `memory` for single-instance deployments). The minimal Compose variant uses memory by default; `MEMORY_SESSION_CACHE_MAX_ENTRIES` limits it with LRU eviction (#117).
+- Local, provider-specific solving for embedded ALTCHA and Friendly Captcha v1/v2 proof-of-work widgets in browser tiers (#121).
+
+### Fixed
+- Remove stale content-encoding and representation metadata from browser-backed MITM proxy responses after Playwright has decoded their bodies, preventing clients such as .NET `HttpClient` from attempting a second decompression while preserving raw Tier 1 responses (#126).
+- Detect DuckDuckGo anomaly challenge walls in Tier 1 and the MITM proxy, escalating them to browser tiers instead of returning challenge HTML as successful content (#119).
+
+## [1.5.0] - 2026-09-04
+
+### Changed
+- Bump all application and internal package versions to `1.5.0`.
+- Updated all direct and compatible transitive dependencies to their latest available releases, including Bun 1.4.0, Camoufox 152.0.4-beta.29, uBlock Origin 1.74.0, Biome 2.5.12, Elysia 1.4.30, Zod 4.5.4, and Patchright 1.62.3. Playwright Core remains on 1.60.0 for Camoufox compatibility, and the Nuxt app remains on TypeScript 5.9.3 for vue-tsc compatibility.
+- Reorganized runtime configuration into concise subsystem namespaces. Console/network limits now use `DIAGNOSTICS_*`, redirect-chain limits use `REDIRECT_*`, response-body limits remain under `CAPTURE_*`, forward-proxy settings use `MITM_*`, and Redis session expiry is `REDIS_SESSION_TTL_SECONDS`. `BROWSER_MAX_CONTENT_PROCESSES` now makes the process cap explicit; the unused `CHROME_EXECUTABLE` entry was removed. These names replace the previous environment variables without compatibility aliases; the [configuration migration guide](apps/docs/deployment/configuration-migration.md) contains the complete mapping.
+- An empty or unset `REDIS_URL` now disables the optional session cache without attempting a localhost connection or requiring a separate enable flag.
+- Supplied Compose variants now explicitly pass every supported runtime tuning variable from `.env` into the container instead of silently ignoring screenshot, diagnostics, redirect, response-capture, and CAPTCHA settings.
+- Renamed internal byte/character limits to `STREAM_THRESHOLD_BYTES` and `MCP_HTML_MAX_CHARS`, and namespaced the Camoufox font-retention build argument as `CAMOUFOX_KEEP_SPOOFED_OS_FONTS`.
+
+### Added
+- Expanded the optional MCP server with purpose-specific `read`, `scrape`, `screenshot`, and `inspect` tools. AI clients can now receive readability-extracted Markdown/text, native image content, richer scrape metadata, or bounded browser diagnostics without exposing cookies, sessions, request headers, proxy credentials, or captured API response bodies. The original `scrape_url` remains as a compatibility alias.
+- Optional `MITM_ALWAYS_SCRAPE=true` mode skips the forward proxy's direct Tier 0 probe and routes ordinary HTTP requests immediately into the existing scraper ladder for sites where the probe itself triggers a temporary ban (#93). WebSocket relays remain direct; the mode is off by default and documented as unsuitable for general media/download traffic because it bypasses Tier 0 streaming.
+- **DataDome support.** Detect Device Check, slider CAPTCHA and `t=bv` hard blocks from challenge markers and `x-dd-b`. Device Check uses a dedicated waiter and an optional headful Xvfb pool; the slider is reported as `datadome-captcha-required`. Enable startup-warmed capacity with `BROWSER_HEADFUL_POOL_SIZE=1` (off by default).
+- **AWS WAF Challenge support.** Detect the documented `202` Challenge and `405` CAPTCHA responses from their `x-amzn-waf-action` header, with a conservative two-marker HTML fallback. Silent challenges use a dedicated browser waiter for the domain-matching `aws-waf-token`; interactive CAPTCHA is surfaced as `aws-waf-captcha-required` for a future solver.
+- Optional response-body capture: `captureResponses` on `POST /scrape` takes URL patterns (a substring, or a glob when the pattern contains `*` or `?`) and returns the matching responses' bodies in `ScrapeResult.capturedResponses`, so a page that ships an empty shell and loads its content over a background request is still readable. `settleTimeout` holds the page open after load waiting for a match and `waitForSelector` ends that window early. Off by default — without patterns no listener is attached. Pattern count, body count, per-body bytes and total bytes are bounded and tunable via `CAPTURE_*`; a body over its budget comes back trimmed and flagged `truncated`, a binary or unknown content type comes back base64, and a body that cannot be read carries its own `error` rather than failing the scrape.
+- Optional console, network and redirect-chain capture: `consoleLogs`, `networkLogs` and `redirectChain` on `POST /scrape` return the page's console messages, per-request resource timings, and the URLs the main document walked (`ScrapeResult.consoleLogs` / `networkLogs` / `redirectChain`), captured by the browser tiers (2-4). Each flag is independent and off by default — without it no listener is attached and nothing is buffered. Diagnostics use `DIAGNOSTICS_*` limits and redirect chains use independent `REDIRECT_*` limits; anything past a cap is dropped whole rather than truncated, and a capture failure leaves the field unset rather than failing the scrape.
+- Optional viewport screenshot: `screenshot: true` on `POST /scrape` returns a base64 JPEG of the viewport in `ScrapeResult.screenshot`, captured by the browser tiers (2-4) immediately before the HTML read so image and markup describe the same moment. Off by default; a stock request attaches nothing and does no extra work. Settle wait, capture timeout, JPEG quality, and maximum image size are bounded and tunable via `SCREENSHOT_*`, and a capture failure leaves the field unset rather than failing the scrape.
+
+### Fixed
+- Gate every nightly, release, and baseline container publish on a successful clean `bun run verify`, preventing images from being pushed when CI fails. Update the Biome schema and web formatting for Biome 2.5.12.
+- Add RFC 5280 Subject Key Identifiers to generated MITM roots and leaf certificates and a matching Authority Key Identifier to leaves, restoring compatibility with strict TLS clients such as Python 3.13 (#113). Existing roots missing SKI are re-signed once with the same CA key and identity fields; initialization is serialized across processes and invalid existing identifiers fail safely. Because migration changes the certificate fingerprint, existing MITM deployments should download and re-import the updated `ca.crt` into client trust stores.
+- Recover the Redis-backed Tier 2 cache after a transient startup timeout without restarting TRAWL. Connection attempts are bounded by `REDIS_CONNECT_TIMEOUT_MS`, retry in the background after `REDIS_RETRY_DELAY_MS`, and stop cleanly during shutdown; setting the retry delay to `0` disables reconnects for intentionally cacheless deployments (#92).
+- Correct Docker troubleshooting commands to use the actual `trawl` Compose service name, and distinguish Prowlarr's always-available FlareSolverr API on port 8191 from the opt-in forward proxy on port 8192 (#96).
+- Wait for the bundled Redis service to pass a `PING` healthcheck before starting TRAWL, preventing a transient Compose startup race from disabling the Tier 2 session cache for the process lifetime (#90).
+- Reap orphaned Camoufox processes in both API container variants by running Bun under Tini (#79).
+- Preserve every upstream `Set-Cookie` field across direct, Tier 1, and browser-backed proxy responses, serializing each cookie as its own HTTP header instead of dropping or malformedly folding repeated values (#64).
+- Treat an explicit request-level `proxy` as a strict routing guarantee: route HTTP(S) Tier 1 requests through it, skip direct Tier 1 for SOCKS, bypass the unproxied Tier 2 cache, prevent proxy-derived sessions from entering the shared domain cache, disable Firefox direct failover, and surface authentication, transport, protocol, and `Proxy-Status` failures as errors instead of successful content (#73).
+
+## [1.4.2] - 2026-08-22
+
+### Changed
+- Bump all application and internal package versions to `1.4.2`.
+
+### Fixed
+- Detect and resolve DDoS-Guard JS interstitials without misclassifying them as Cloudflare challenges (#66).
+
+## [1.4.1] - 2026-08-21
+
+### Changed
+- Bump all application and internal package versions to `1.4.1`.
+- Update the container and development runtime to Bun 1.4.0, Biome to 2.5.10, Bun types to 1.4.0, Patchright to 1.62.1, Nuxt SEO to 5.3.14, and vue-tsc to 3.3.11.
+- Update GeoLite2 City to 2026.08.19 after the previously pinned upstream release became unavailable.
+- Keep Playwright Core on 1.60.0 for Camoufox compatibility and the Nuxt app on TypeScript 5.9.3 for vue-tsc compatibility; other workspaces use TypeScript 7.0.2.
+
+### Fixed
+- Remove the unused native TypeScript compiler from both production API images and fail image builds if a native `@typescript/typescript-*` artifact is present, eliminating its fixable HIGH runtime CVEs (#68).
+
 ## [1.4.0] - 2026-08-10
 
 ### Changed

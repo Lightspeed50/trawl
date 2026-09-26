@@ -7,13 +7,42 @@ description: Common issues and how to fix them.
 
 ## API never becomes ready
 
-**Symptom:** `docker compose logs api` shows browser launches but the API never prints `ready — all N browsers warm`.
+**Symptom:** `docker compose logs trawl` shows browser launches but the API never prints `ready — all N browsers warm`.
 
 **Causes:**
 
-1. **Redis not reachable** — Check `REDIS_URL`. From inside Docker, use `redis://redis:6379` not `redis://localhost:6379`.
-2. **Camoufox binary not installed** — The API Dockerfile runs `bunx camoufox-js fetch`. If this step was skipped (e.g. build cache reuse), rebuild: `docker compose build --no-cache api`.
-3. **shm_size too small** — Ensure `shm_size: 1gb` is set on the API service.
+1. **Camoufox binary not installed** — The API image normally installs it during publication.
+   The supplied Compose files use a prebuilt image and have no `build` section, so
+   `docker compose build` intentionally does nothing. Pull and recreate the service instead:
+   `docker compose pull trawl && docker compose up -d --force-recreate trawl`.
+2. **shm_size too small** — Ensure `shm_size: 1gb` is set on the API service.
+
+Redis is optional at runtime. If it is unavailable, TRAWL temporarily disables the Tier 2
+session-cache fast path but can still become ready and scrape through the other tiers. Unless
+`REDIS_RETRY_DELAY_MS=0`, it keeps reconnecting in the background.
+
+## Logs report `Tier 2 disabled`
+
+**Symptom:** TRAWL starts, but its logs contain `session cache unavailable — Tier 2 disabled` even
+though `docker compose exec redis redis-cli ping` returns `PONG`.
+
+The Redis-container check only proves that Redis is healthy now. Verify the configured URL, Docker
+DNS, and a fresh Redis connection from inside the already-running TRAWL container:
+
+```bash
+docker compose exec trawl sh -lc 'printf "%s\n" "$REDIS_URL"; getent hosts redis'
+docker compose exec trawl bun -e 'import { RedisClient } from "bun"; const client = new RedisClient(process.env.REDIS_URL); await client.connect(); console.log(await client.ping()); client.close()'
+```
+
+With the supplied Redis-backed Compose files, TRAWL waits for the Redis healthcheck before
+starting. A slow host may still exceed the client-side connection timeout; TRAWL now retries in the
+background and logs `session cache connected` when Tier 2 becomes available, without a process
+restart. Increase `REDIS_CONNECT_TIMEOUT_MS` if every attempt times out, or adjust
+`REDIS_RETRY_DELAY_MS` to change the retry interval.
+
+If the command fails, inspect `docker compose config` for an overridden `REDIS_URL`, custom
+`network_mode`, or networks that are not shared by the `trawl` and `redis` services. Inside Docker,
+use `redis://redis:6379`, not `redis://localhost:6379`.
 
 ### Startup timeout behind Gluetun
 
@@ -72,14 +101,14 @@ docker compose up -d --force-recreate
 **Causes:**
 
 1. **Redis session data is not persisting** — Run `docker compose exec redis redis-cli keys "session:*"` after a successful scrape. If empty, the session cache write is failing. Check API logs for Redis connection errors.
-2. **`SESSION_TTL_SECONDS` set too low** — If it's shorter than Cloudflare's challenge interval, the cache expires before the next request.
+2. **`REDIS_SESSION_TTL_SECONDS` set too low** — If it's shorter than Cloudflare's challenge interval, the cache expires before the next request.
 3. **Domain key mismatch** — The key is the hostname only. `sub.example.com` and `www.example.com` are separate sessions.
 
 ## POST /v1 returns HTTP 429 with `status: "error"`
 
 **Symptom:** Request returns **HTTP 429** (not 500) with a FlareSolverr v2 envelope and `message: "Browser pool saturated, retry shortly"`.
 
-**Cause:** TRAWL polled for `BROWSER_ACQUIRE_TIMEOUT_MS` (default 15s) without finding an idle browser. With `BROWSER_POOL_SIZE=3` and 10 concurrent requests, this only fires under sustained burst pressure.
+**Cause:** TRAWL polled for `BROWSER_ACQUIRE_TIMEOUT_MS` (default 15s) without finding an idle browser. The default pool contains one browser to keep ordinary Prowlarr and scraper deployments memory-efficient.
 
 **Fixes (in order of preference):**
 
@@ -95,7 +124,7 @@ docker compose up -d --force-recreate
 
 1. **Cloudflare introduced a harder challenge** — Some sites use Turnstile or WAF rules that are harder to bypass. Check the API logs for the actual error.
 2. **Pool exhausted** — All browsers are busy. Increase `BROWSER_POOL_SIZE`.
-3. **Proxy not working** — If `PROXY_URL` is configured and invalid, Tier 3 will fail consistently. Test the proxy directly: `curl --proxy $PROXY_URL https://nowsecure.nl`.
+3. **Proxy not working** — If `PROXY_URL` is configured and invalid, Tier 3 will fail consistently. Test HTTP proxies with `curl --proxy "$PROXY_URL" https://nowsecure.nl`. For SOCKS5, test proxy-side DNS explicitly with `curl --proxy socks5h://host:port https://nowsecure.nl`; TRAWL enables the equivalent Firefox remote-DNS preference automatically.
 
 ## Prowlarr FlareSolverr test fails
 
@@ -106,11 +135,34 @@ docker compose up -d --force-recreate
 2. Prowlarr can reach the TRAWL container. If they're in different Docker networks, add TRAWL to Prowlarr's network (see [Prowlarr docs](/integrations/prowlarr)).
 3. Run `docker exec prowlarr curl -s http://trawl:8191/health` to verify network reachability from inside the Prowlarr container.
 
+## Prowlarr reports `Unable to connect to proxy`
+
+First identify which TRAWL interface Prowlarr is using:
+
+- **FlareSolverr integration:** configure `http://trawl:8191` under **Settings → Indexers →
+  FlareSolverr**. Port `8191` is the API and does not require `MITM_ENABLED`.
+- **HTTP indexer proxy:** port `8192` is disabled by default. Set `MITM_ENABLED=true`, recreate
+  the TRAWL service, and configure an HTTP proxy with host `trawl` and port `8192`. HTTPS targets
+  also require TRAWL's CA in the Prowlarr container trust store; see
+  [Proxy client setup](/proxy/client-setup#prowlarr).
+
+The supplied Compose service is named `trawl`, not `api`. Check both interfaces from the Prowlarr
+container when diagnosing Docker networking:
+
+```bash
+docker exec prowlarr curl -fsS http://trawl:8191/health
+docker exec prowlarr curl -fsS --proxy http://trawl:8192 http://neverssl.com/ -o /dev/null
+```
+
+The second command succeeds only when the optional forward proxy is enabled. If either hostname
+lookup fails, attach Prowlarr and TRAWL to the same Docker network before changing application
+settings.
+
 ## High memory usage / OOM kills
 
-Each Camoufox instance uses 350–500 MB. With 3 browsers, expect ~1.5 GB total. If the API is being killed:
+Each Camoufox instance uses 350–500 MB, and temporary contexts or rolling replacement create short peaks. If the API is being killed:
 
-1. Reduce `BROWSER_POOL_SIZE` to 1 or 2
+1. Keep `BROWSER_POOL_SIZE=1` for a 1 GB container, or allow at least 2 GB for pool 3
 2. Upgrade the server (more RAM or more cores)
 3. Ensure `shm_size: 1gb` is set — Firefox uses `/dev/shm` heavily
 
@@ -118,7 +170,7 @@ Each Camoufox instance uses 350–500 MB. With 3 browsers, expect ~1.5 GB total.
 
 ```bash
 # Live API logs
-docker compose logs -f api
+docker compose logs -f trawl
 
 # Check Redis keys
 docker compose exec redis redis-cli keys "*"

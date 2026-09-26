@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { BrowserPool } from "../src/pool"
+import { BrowserPool, PROXY_SAFETY_FIREFOX_PREFS } from "../src/pool"
 
 const pools: BrowserPool[] = []
 
@@ -62,7 +62,28 @@ function makeFactory() {
   return { factory, browsers, contexts }
 }
 
+describe("BrowserPool mode", () => {
+  test("marks leases from a virtual-display pool as headful", async () => {
+    const { factory } = makeFactory()
+    const pool = createPool({ poolSize: 2, virtualDisplay: true, browserFactory: factory })
+    await pool.init()
+
+    const first = await pool.acquire()
+    const second = await pool.acquire()
+    expect(first.headful).toBeTrue()
+    expect(second.headful).toBeTrue()
+
+    pool.release(first.id, first.lease)
+    expect(pool.getStats().available).toBe(1)
+  })
+})
+
 describe("BrowserPool recycling", () => {
+  test("prevents direct fallback and local DNS resolution for proxied navigations", () => {
+    expect(PROXY_SAFETY_FIREFOX_PREFS["network.proxy.failover_direct"]).toBeFalse()
+    expect(PROXY_SAFETY_FIREFOX_PREFS["network.proxy.socks_remote_dns"]).toBeTrue()
+  })
+
   test("publishes the first browser before warming remaining capacity concurrently", async () => {
     const { factory: baseFactory } = makeFactory()
     let activeLaunches = 0

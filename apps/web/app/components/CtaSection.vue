@@ -70,12 +70,12 @@ const tabs: { id: Tab; label: string; hint: string }[] = [
     <span class="k">image:</span> <span class="s">ghcr.io/germondai/trawl:latest</span>
     <span class="k">ports:</span>
       - <span class="s">"${PORT:-8191}:8191"</span>
-      - <span class="s">"${MITM_PROXY_PORT:-8192}:${MITM_PROXY_PORT:-8192}"</span>
+      - <span class="s">"${MITM_PORT:-8192}:${MITM_PORT:-8192}"</span>
     <span class="k">shm_size:</span> <span class="s">1gb</span>
     <span class="k">environment:</span>
       <span class="k">BROWSER_POOL_SIZE:</span> <span class="s">1</span>
-      <span class="k">MITM_PROXY_ENABLED:</span> <span class="s">${MITM_PROXY_ENABLED:-false}</span>
-      <span class="k">MITM_PROXY_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
+      <span class="k">MITM_ENABLED:</span> <span class="s">${MITM_ENABLED:-false}</span>
+      <span class="k">MITM_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
     <span class="k">volumes:</span>
       - <span class="s">trawl_proxy_ca:/data/proxy-ca</span>
     <span class="k">healthcheck:</span>
@@ -90,22 +90,26 @@ const tabs: { id: Tab; label: string; hint: string }[] = [
             </div>
             <pre class="snippet-body"><code><span class="k">services:</span>
   redis:
-    <span class="k">image:</span> <span class="s">redis:8.8.1-alpine</span>
+    <span class="k">image:</span> <span class="s">redis:8.10.2-alpine</span>
     <span class="k">volumes:</span> [<span class="s">redis_data:/data</span>]
+    <span class="k">healthcheck:</span>
+      <span class="k">test:</span> [<span class="s">"CMD"</span>, <span class="s">"redis-cli"</span>, <span class="s">"ping"</span>]
   trawl:
     <span class="k">image:</span> <span class="s">ghcr.io/germondai/trawl:latest</span>
     <span class="k">ports:</span>
       - <span class="s">"${PORT:-8191}:8191"</span>
-      - <span class="s">"${MITM_PROXY_PORT:-8192}:${MITM_PROXY_PORT:-8192}"</span>
+      - <span class="s">"${MITM_PORT:-8192}:${MITM_PORT:-8192}"</span>
     <span class="k">shm_size:</span> <span class="s">1gb</span>
     <span class="k">environment:</span>
       <span class="k">REDIS_URL:</span> <span class="s">redis://redis:6379</span>
       <span class="k">BROWSER_POOL_SIZE:</span> <span class="s">${BROWSER_POOL_SIZE:-1}</span>
-      <span class="k">MITM_PROXY_ENABLED:</span> <span class="s">${MITM_PROXY_ENABLED:-false}</span>
-      <span class="k">MITM_PROXY_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
+      <span class="k">MITM_ENABLED:</span> <span class="s">${MITM_ENABLED:-false}</span>
+      <span class="k">MITM_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
     <span class="k">volumes:</span>
       - <span class="s">trawl_proxy_ca:/data/proxy-ca</span>
-    <span class="k">depends_on:</span> [<span class="s">redis</span>]
+    <span class="k">depends_on:</span>
+      redis:
+        <span class="k">condition:</span> <span class="s">service_healthy</span>
 <span class="k">volumes:</span>
   redis_data:
   trawl_proxy_ca:</code></pre>
@@ -117,25 +121,29 @@ const tabs: { id: Tab; label: string; hint: string }[] = [
             </div>
             <pre class="snippet-body"><code><span class="k">services:</span>
   redis:
-    <span class="k">image:</span> <span class="s">redis:8.8.1-alpine</span>
+    <span class="k">image:</span> <span class="s">redis:8.10.2-alpine</span>
     <span class="k">restart:</span> <span class="s">always</span>
     <span class="k">volumes:</span> [<span class="s">redis_data:/data</span>]
+    <span class="k">healthcheck:</span>
+      <span class="k">test:</span> [<span class="s">"CMD"</span>, <span class="s">"redis-cli"</span>, <span class="s">"ping"</span>]
   trawl:
     <span class="k">image:</span> <span class="s">ghcr.io/germondai/trawl:latest</span>
     <span class="k">restart:</span> <span class="s">always</span>
     <span class="k">ports:</span>
       - <span class="s">"${PORT:-8191}:8191"</span>
-      - <span class="s">"${MITM_PROXY_PORT:-8192}:${MITM_PROXY_PORT:-8192}"</span>
+      - <span class="s">"${MITM_PORT:-8192}:${MITM_PORT:-8192}"</span>
     <span class="k">shm_size:</span> <span class="s">1gb</span>
     <span class="k">mem_limit:</span> <span class="s">3g</span>
     <span class="k">environment:</span>
       <span class="k">REDIS_URL:</span> <span class="s">redis://redis:6379</span>
       <span class="k">BROWSER_POOL_SIZE:</span> <span class="s">3</span>
-      <span class="k">MITM_PROXY_ENABLED:</span> <span class="s">${MITM_PROXY_ENABLED:-false}</span>
-      <span class="k">MITM_PROXY_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
+      <span class="k">MITM_ENABLED:</span> <span class="s">${MITM_ENABLED:-false}</span>
+      <span class="k">MITM_CA_DIR:</span> <span class="s">/data/proxy-ca</span>
     <span class="k">volumes:</span>
       - <span class="s">trawl_proxy_ca:/data/proxy-ca</span>
-    <span class="k">depends_on:</span> [<span class="s">redis</span>]
+    <span class="k">depends_on:</span>
+      redis:
+        <span class="k">condition:</span> <span class="s">service_healthy</span>
     <span class="k">healthcheck:</span>
       <span class="k">test:</span> [<span class="s">"CMD"</span>, <span class="s">"curl"</span>, <span class="s">"-sf"</span>, <span class="s">"http://localhost:8191/health"</span>]
       <span class="k">interval:</span> <span class="s">30s</span>

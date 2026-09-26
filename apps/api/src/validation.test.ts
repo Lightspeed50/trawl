@@ -32,6 +32,54 @@ describe("API request validation", () => {
     expect(() => validateScrapeRequest({ method: "GET", url: "https://example.com" })).not.toThrow()
   })
 
+  test("accepts boolean screenshot flags and rejects other values", () => {
+    expect(() => validateScrapeRequest({ url: "https://example.com", screenshot: true })).not.toThrow()
+    expect(() => validateScrapeRequest({ url: "https://example.com", screenshot: false })).not.toThrow()
+    expect(() => validateScrapeRequest({ url: "https://example.com", screenshot: "true" })).toThrow(
+      new RequestValidationError("screenshot must be a boolean", 400),
+    )
+  })
+
+  for (const field of [
+    "consoleLogs",
+    "networkLogs",
+    "redirectChain",
+    "blockedEvidence",
+    "mhtml",
+    "ignoreCertificateErrors",
+    "favicons",
+  ] as const) {
+    test(`accepts boolean ${field} flags and rejects other values`, () => {
+      expect(() => validateScrapeRequest({ url: "https://example.com", [field]: true })).not.toThrow()
+      expect(() => validateScrapeRequest({ url: "https://example.com", [field]: false })).not.toThrow()
+      expect(() => validateScrapeRequest({ url: "https://example.com", [field]: "true" })).toThrow(
+        new RequestValidationError(`${field} must be a boolean`, 400),
+      )
+    })
+  }
+
+  test("validates response-capture patterns", () => {
+    expect(() => validateScrapeRequest({ url: "https://example.com", captureResponses: ["/api/*"] })).not.toThrow()
+    for (const captureResponses of ["/api", ["ok", 3], [""], ["   "], ["x".repeat(2_001)], Array(11).fill("x")]) {
+      expect(() => validateScrapeRequest({ url: "https://example.com", captureResponses })).toThrow(
+        RequestValidationError,
+      )
+    }
+  })
+
+  test("validates response-capture settling options", () => {
+    expect(() => validateScrapeRequest({ url: "https://example.com", settleTimeout: 0 })).not.toThrow()
+    expect(() => validateScrapeRequest({ url: "https://example.com", waitForSelector: "#results" })).not.toThrow()
+    for (const settleTimeout of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "10"]) {
+      expect(() => validateScrapeRequest({ url: "https://example.com", settleTimeout })).toThrow(RequestValidationError)
+    }
+    for (const waitForSelector of ["", "   ", 42]) {
+      expect(() => validateScrapeRequest({ url: "https://example.com", waitForSelector })).toThrow(
+        RequestValidationError,
+      )
+    }
+  })
+
   test("extracts only string URLs for error envelopes", () => {
     expect(requestUrl({ url: "https://example.com" })).toBe("https://example.com")
     expect(requestUrl({ url: 42 })).toBe("")
