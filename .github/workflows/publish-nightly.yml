@@ -1,8 +1,8 @@
 name: Publish Nightly
 
 # Builds the disposable `:nightly` and `:nightly-<sha>` tags of
-# `ghcr.io/.../trawl` from the latest `dev` commit every day at 02:00 UTC, or
-# when a maintainer starts the workflow manually.
+# `ghcr.io/.../trawl` from the latest `dev` commit when a maintainer
+# starts the workflow manually. Automatic nightly builds are disabled.
 #
 # Lives separately from publish.yml (release builds on `v*` tags) and
 # publish-baseline.yml (baseline runtime builds on `v*`/`*-baseline` tags)
@@ -12,13 +12,11 @@ name: Publish Nightly
 #   - each workflow has its own GHA cache scope (no cross-pollution)
 #
 # Tag contract:
-#   - scheduled/manual run -> :nightly-<dev-sha> + :nightly
+#   - manual run -> :nightly-<dev-sha> + :nightly
 #   - `:latest` is intentionally NOT touched here — that's owned by
 #     publish.yml and only moves on `v*` release pushes.
 
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
 
 # Only the newest dev revision needs a rolling nightly image. Digest-addressed
@@ -158,10 +156,10 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            # Scheduled/manual dev build → :nightly (disposable test build).
+            # Manual dev build → :nightly (disposable test build).
             type=raw,value=nightly
             # Pin the tag to the dev revision, not the default-branch revision
-            # from which GitHub loads scheduled workflow definitions.
+            # from which GitHub loads the workflow definition.
             type=raw,value=nightly-${{ needs.revision.outputs.short-sha }}
 
       - name: Create and push multi-arch manifest
